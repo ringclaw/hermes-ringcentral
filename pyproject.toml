@@ -22,10 +22,10 @@ dev = [
 ]
 
 [project.entry-points]
-"hermes.plugins" = {ringcentral = "__init__:register"}
+"hermes_agent.plugins" = {ringcentral = "ringcentral:register"}
 
-[tool.setuptools]
-py-modules = ["adapter", "rc_client", "rc_ws", "__init__"]
+[tool.setuptools.packages.find]
+include = ["ringcentral*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

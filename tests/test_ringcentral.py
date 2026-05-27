@@ -10,22 +10,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Ensure the repo root is on sys.path so top-level modules resolve.
+# Ensure the repo root is on sys.path so `ringcentral` package resolves.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from __init__ import (  # noqa: E402
+from ringcentral import (  # noqa: E402
+    register,
+)
+from ringcentral.adapter import (  # noqa: E402
     RingCentralAdapter,
-    RingCentralWebSocket,
     check_requirements,
     _content_type_for_filename,
     _env_enablement,
     _is_connected,
     _standalone_send,
-    _rc_adapter_module as _rc_mod,
+    _strip_rc_mentions,
+    DEFAULT_SERVER_URL,
 )
-from rc_ws import _OWN_POST_HISTORY  # noqa: E402
+from ringcentral.rc_ws import RingCentralWebSocket, _OWN_POST_HISTORY  # noqa: E402
+from ringcentral import adapter as _rc_mod  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -73,37 +77,25 @@ class TestStripRCMentions:
     BOT_ID = "55512345"
 
     def test_plain_text_passthrough(self):
-        from adapter import _strip_rc_mentions
-
         assert _strip_rc_mentions("hello world", self.BOT_ID) == "hello world"
 
     def test_strip_leading_bot_mention(self):
-        from adapter import _strip_rc_mentions
-
         text = f"![:Person]({self.BOT_ID}) summarize this"
         assert _strip_rc_mentions(text, self.BOT_ID) == "summarize this"
 
     def test_strip_multiple_leading_mentions(self):
-        from adapter import _strip_rc_mentions
-
         text = f"![:Person]({self.BOT_ID}) ![:Person](99999999) hi"
         assert _strip_rc_mentions(text, self.BOT_ID) == "hi"
 
     def test_mid_text_mention_dropped(self):
-        from adapter import _strip_rc_mentions
-
         text = f"![:Person]({self.BOT_ID}) cc ![:Person](99999999) test"
         assert "![:Person]" not in _strip_rc_mentions(text, self.BOT_ID)
 
     def test_team_mention_form(self):
-        from adapter import _strip_rc_mentions
-
         text = f"![:Team]({self.BOT_ID}) check status"
         assert _strip_rc_mentions(text, self.BOT_ID) == "check status"
 
     def test_no_bot_id_preserves_text(self):
-        from adapter import _strip_rc_mentions
-
         text = "![:Person](99999999) hello"
         result = _strip_rc_mentions(text, None)
         assert "![:Person]" not in result
@@ -127,14 +119,12 @@ class TestWebSocketEchoDedup:
         assert ws.is_own_post("p-999") is False
 
     def test_creator_id_filters_own_messages(self):
-        """Inbound events whose creatorId matches the bot are dropped."""
         callback = AsyncMock()
         ws = RingCentralWebSocket(
             client=MagicMock(),
             on_event=callback,
             own_person_id="bot-1",
         )
-
         body = {
             "eventType": "PostAdded",
             "id": "p-100",
@@ -146,7 +136,6 @@ class TestWebSocketEchoDedup:
         callback.assert_not_awaited()
 
     def test_marked_post_id_filters_echoes(self):
-        """A post id flagged via ``mark_own_post`` is suppressed on inbound."""
         callback = AsyncMock()
         ws = RingCentralWebSocket(
             client=MagicMock(),
@@ -154,7 +143,6 @@ class TestWebSocketEchoDedup:
             own_person_id="bot-1",
         )
         ws.mark_own_post("p-42")
-
         body = {
             "eventType": "PostAdded",
             "id": "p-42",
@@ -172,7 +160,6 @@ class TestWebSocketEchoDedup:
             on_event=callback,
             own_person_id="bot-1",
         )
-
         body = {
             "eventType": "PostAdded",
             "id": "p-77",
@@ -184,7 +171,6 @@ class TestWebSocketEchoDedup:
         callback.assert_awaited_once_with(body)
 
     def test_history_bounded(self):
-        """Marking more than the history cap should not grow the lookup set unboundedly."""
         ws = RingCentralWebSocket(MagicMock(), AsyncMock(), own_person_id="bot")
         for i in range(_OWN_POST_HISTORY + 50):
             ws.mark_own_post(f"p-{i}")
@@ -212,7 +198,6 @@ class TestRequirementsCheck:
 
     def test_fails_when_aiohttp_missing(self, monkeypatch):
         monkeypatch.setenv("RC_BOT_TOKEN", "jwt-abc")
-
         import builtins
 
         real_import = builtins.__import__
@@ -240,7 +225,6 @@ class TestEnvEnablement:
         monkeypatch.setenv("RC_BOT_TOKEN", "jwt-abc")
         monkeypatch.setenv("RC_SERVER_URL", "https://platform.devtest.ringcentral.com")
         monkeypatch.delenv("RC_HOME_CHANNEL", raising=False)
-
         seed = _env_enablement()
         assert seed is not None
         assert seed["token"] == "jwt-abc"
@@ -251,7 +235,6 @@ class TestEnvEnablement:
         monkeypatch.setenv("RC_BOT_TOKEN", "jwt-abc")
         monkeypatch.setenv("RC_HOME_CHANNEL", "g-home-1")
         monkeypatch.setenv("RC_HOME_CHANNEL_NAME", "Updates")
-
         seed = _env_enablement() or {}
         assert seed.get("home_channel") == {
             "chat_id": "g-home-1",
@@ -287,7 +270,7 @@ class TestAdapterInit:
 
         cfg = PlatformConfig(enabled=True, token="t", extra={})
         adapter = RingCentralAdapter(cfg)
-        assert adapter._server_url == _rc_mod.DEFAULT_SERVER_URL
+        assert adapter._server_url == DEFAULT_SERVER_URL
 
     def test_server_url_from_env(self, monkeypatch):
         monkeypatch.setenv("RC_SERVER_URL", "https://platform.devtest.ringcentral.com")
@@ -322,11 +305,9 @@ class TestAdapterSend:
 
     def test_send_routes_through_client_and_marks_echo(self):
         adapter = _make_adapter()
-
         client = MagicMock()
         client.send_post = AsyncMock(return_value={"id": "p-new-1"})
         adapter._client = client
-
         ws = MagicMock()
         ws.mark_own_post = MagicMock()
         adapter._ws = ws
