@@ -1,0 +1,38 @@
+name: ringcentral-platform
+label: RingCentral
+kind: platform
+version: 1.0.0
+description: >
+  RingCentral Team Messaging gateway adapter for Hermes Agent.
+  Connects a RingCentral bot to the Hermes agent via the v1
+  Team Messaging REST API + WebSocket subscription stream.
+  Relays posts in chats (DMs / teams / groups) to the agent and
+  delivers replies, file uploads, and edits back through the
+  RingCentral platform.
+author: Nous Research
+requires_env:
+  - name: RC_BOT_TOKEN
+    description: "RingCentral bot JWT (Bearer token issued by the RingCentral developer portal)"
+    prompt: "RingCentral bot token (JWT)"
+    password: true
+optional_env:
+  - name: RC_SERVER_URL
+    description: "RingCentral API base URL (default: https://platform.ringcentral.com). Use https://platform.devtest.ringcentral.com for sandbox."
+    prompt: "RingCentral server URL"
+    password: false
+  - name: RC_ALLOWED_USERS
+    description: "Comma-separated RingCentral person IDs allowed to talk to the bot"
+    prompt: "Allowed user IDs (comma-separated)"
+    password: false
+  - name: RC_ALLOW_ALL_USERS
+    description: "Allow any RingCentral user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: RC_HOME_CHANNEL
+    description: "Default chat/group ID for cron / notification delivery"
+    prompt: "Home chat ID"
+    password: false
+  - name: RC_HOME_CHANNEL_NAME
+    description: "Display name for the home chat (used in gateway status)"
+    prompt: "Home chat display name"
+    password: false
