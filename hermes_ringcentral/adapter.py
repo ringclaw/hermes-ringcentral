@@ -116,11 +116,35 @@ def _strip_rc_mentions(text: str, own_person_id: Optional[str]) -> str:
     return stripped.strip()
 
 
+def _ensure_ringcentral_platform() -> Platform:
+    """Register 'ringcentral' in the Platform enum if absent.
+
+    External plugins live outside the hermes-agent tree, so their platform
+    name is not part of the built-in ``Platform`` enum.  We inject it at
+    import time so ``Platform("ringcentral")`` resolves cleanly.
+    """
+    try:
+        return Platform("ringcentral")
+    except ValueError:
+        # Dynamically extend the enum — stdlib Enum allows injecting new
+        # members via _value2member_map_ (used by other Hermes plugins).
+        member = object.__new__(Platform)
+        member._name_ = "ringcentral"
+        member._value_ = "ringcentral"
+        Platform._value2member_map_["ringcentral"] = member
+        Platform._member_map_["ringcentral"] = member
+        Platform._member_names_.append("ringcentral")
+        return member
+
+
+_RC_PLATFORM = _ensure_ringcentral_platform()
+
+
 class RingCentralAdapter(BasePlatformAdapter):
     """Gateway adapter for RingCentral Team Messaging."""
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform("ringcentral"))
+        super().__init__(config, _RC_PLATFORM)
 
         extra = getattr(config, "extra", {}) or {}
 
