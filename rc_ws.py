@@ -22,7 +22,7 @@ import random
 from collections import deque
 from typing import Any, Awaitable, Callable, Deque, Optional, Set
 
-from .rc_client import RingCentralClient
+from rc_client import RingCentralClient
 
 logger = logging.getLogger(__name__)
 

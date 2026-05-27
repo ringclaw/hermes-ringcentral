@@ -40,8 +40,8 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import MessageDeduplicator
 
-from .rc_client import DEFAULT_SERVER_URL, RingCentralClient
-from .rc_ws import RingCentralWebSocket
+from rc_client import DEFAULT_SERVER_URL, RingCentralClient
+from rc_ws import RingCentralWebSocket
 
 logger = logging.getLogger(__name__)
 

@@ -10,8 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Import from the installed hermes_ringcentral package
-from hermes_ringcentral import (
+# Ensure the repo root is on sys.path so top-level modules resolve.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from __init__ import (  # noqa: E402
     RingCentralAdapter,
     RingCentralWebSocket,
     check_requirements,
@@ -19,9 +23,9 @@ from hermes_ringcentral import (
     _env_enablement,
     _is_connected,
     _standalone_send,
-    _hermes_ringcentral_adapter as _rc_mod,
+    _rc_adapter_module as _rc_mod,
 )
-from hermes_ringcentral.rc_ws import _OWN_POST_HISTORY
+from rc_ws import _OWN_POST_HISTORY  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -69,36 +73,36 @@ class TestStripRCMentions:
     BOT_ID = "55512345"
 
     def test_plain_text_passthrough(self):
-        from hermes_ringcentral.adapter import _strip_rc_mentions
+        from adapter import _strip_rc_mentions
 
         assert _strip_rc_mentions("hello world", self.BOT_ID) == "hello world"
 
     def test_strip_leading_bot_mention(self):
-        from hermes_ringcentral.adapter import _strip_rc_mentions
+        from adapter import _strip_rc_mentions
 
         text = f"![:Person]({self.BOT_ID}) summarize this"
         assert _strip_rc_mentions(text, self.BOT_ID) == "summarize this"
 
     def test_strip_multiple_leading_mentions(self):
-        from hermes_ringcentral.adapter import _strip_rc_mentions
+        from adapter import _strip_rc_mentions
 
         text = f"![:Person]({self.BOT_ID}) ![:Person](99999999) hi"
         assert _strip_rc_mentions(text, self.BOT_ID) == "hi"
 
     def test_mid_text_mention_dropped(self):
-        from hermes_ringcentral.adapter import _strip_rc_mentions
+        from adapter import _strip_rc_mentions
 
         text = f"![:Person]({self.BOT_ID}) cc ![:Person](99999999) test"
         assert "![:Person]" not in _strip_rc_mentions(text, self.BOT_ID)
 
     def test_team_mention_form(self):
-        from hermes_ringcentral.adapter import _strip_rc_mentions
+        from adapter import _strip_rc_mentions
 
         text = f"![:Team]({self.BOT_ID}) check status"
         assert _strip_rc_mentions(text, self.BOT_ID) == "check status"
 
     def test_no_bot_id_preserves_text(self):
-        from hermes_ringcentral.adapter import _strip_rc_mentions
+        from adapter import _strip_rc_mentions
 
         text = "![:Person](99999999) hello"
         result = _strip_rc_mentions(text, None)

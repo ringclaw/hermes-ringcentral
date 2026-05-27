@@ -1,6 +1,6 @@
 """Hermes RingCentral platform adapter plugin."""
 
-from hermes_ringcentral.adapter import (
+from adapter import (
     RingCentralAdapter,
     check_requirements,
     _content_type_for_filename,
@@ -8,11 +8,13 @@ from hermes_ringcentral.adapter import (
     _is_connected,
     _standalone_send,
     DEFAULT_SERVER_URL,
+    register,
 )
-from hermes_ringcentral.rc_ws import RingCentralWebSocket
-from hermes_ringcentral import adapter as _hermes_ringcentral_adapter
+from rc_ws import RingCentralWebSocket
+import adapter as _rc_adapter_module
 
 __all__ = [
+    "register",
     "RingCentralAdapter",
     "RingCentralWebSocket",
     "check_requirements",
@@ -20,6 +22,6 @@ __all__ = [
     "_env_enablement",
     "_is_connected",
     "_standalone_send",
-    "_hermes_ringcentral_adapter",
+    "_rc_adapter_module",
     "DEFAULT_SERVER_URL",
 ]

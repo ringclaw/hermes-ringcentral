@@ -13,7 +13,6 @@ authors = [{name = "Nous Research"}]
 dependencies = [
     "aiohttp>=3.9.0",
     "websockets>=12.0",
-    "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git",
 ]
 
 [project.optional-dependencies]
@@ -23,11 +22,10 @@ dev = [
 ]
 
 [project.entry-points]
-"hermes.plugins" = {ringcentral = "hermes_ringcentral:register"}
+"hermes.plugins" = {ringcentral = "__init__:register"}
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["hermes_ringcentral*"]
+[tool.setuptools]
+py-modules = ["adapter", "rc_client", "rc_ws", "__init__"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
