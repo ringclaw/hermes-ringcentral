@@ -18,6 +18,12 @@ Configure via env vars::
     RC_SERVER_URL          API base URL (default https://platform.ringcentral.com)
     RC_ALLOWED_USER_EMAILS Comma/semicolon-separated allowed RC user emails
     RC_ALLOW_ALL_USERS     true/false — open access (dev only)
+    RC_ALLOWED_CHANNELS    Comma/semicolon-separated chat IDs the bot may answer in
+    RC_IGNORED_CHANNELS    Comma/semicolon-separated chat IDs the bot never answers in
+    RC_REQUIRE_MENTION     true/false — require bot mention in group chats
+    RC_FREE_RESPONSE_CHANNELS  Chat IDs where group messages do not need mention
+    RC_THREAD_REQUIRE_MENTION  true/false — require mention in participated threads
+    RC_NO_THREAD_CHANNELS  Chat IDs where outbound replies are regular posts
     RC_HOME_CHANNEL        Default chat ID for cron / notification delivery
     RC_HOME_CHANNEL_NAME   Display name for the home chat
     RC_SUMMARY_MESSAGE_LIMIT  Recent messages to fetch for owner DM summary
@@ -67,6 +73,12 @@ _PERMISSION_FALLBACK_STATUSES = {401, 403, 404}
 _ALLOWED_USER_EMAILS_ENV = "RC_ALLOWED_USER_EMAILS"
 _LEGACY_ALLOWED_USERS_ENV = "RC_ALLOWED_USERS"
 _ALLOW_ALL_USERS_ENV = "RC_ALLOW_ALL_USERS"
+_ALLOWED_CHANNELS_ENV = "RC_ALLOWED_CHANNELS"
+_IGNORED_CHANNELS_ENV = "RC_IGNORED_CHANNELS"
+_REQUIRE_MENTION_ENV = "RC_REQUIRE_MENTION"
+_FREE_RESPONSE_CHANNELS_ENV = "RC_FREE_RESPONSE_CHANNELS"
+_THREAD_REQUIRE_MENTION_ENV = "RC_THREAD_REQUIRE_MENTION"
+_NO_THREAD_CHANNELS_ENV = "RC_NO_THREAD_CHANNELS"
 
 _SUMMARY_KEYWORDS = ("summarize", "summarise", "summary", "总结")
 _DEFAULT_SUMMARY_MESSAGE_LIMIT = 250
@@ -191,6 +203,17 @@ def _truthy(raw: Any) -> bool:
     return str(raw or "").strip().lower() in {"true", "1", "yes", "on"}
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"true", "1", "yes", "on"}:
+        return True
+    if raw in {"false", "0", "no", "off"}:
+        return False
+    return default
+
+
 def _normalize_email(raw: Any) -> str:
     value = str(raw or "").strip().lower()
     return value if "@" in value else ""
@@ -206,8 +229,47 @@ def _email_allowlist_from(raw: Any) -> set[str]:
     return {email for part in parts if (email := _normalize_email(part))}
 
 
+def _channel_ids_from(raw: Any) -> set[str]:
+    if isinstance(raw, list):
+        parts: List[str] = []
+        for item in raw:
+            parts.extend(re.split(r"[;,]", str(item or "")))
+    else:
+        parts = re.split(r"[;,]", str(raw or ""))
+    return {part.strip() for part in parts if part.strip()}
+
+
 def _allowed_user_emails() -> set[str]:
     return _email_allowlist_from(os.getenv(_ALLOWED_USER_EMAILS_ENV, ""))
+
+
+def _allowed_channels() -> set[str]:
+    return _channel_ids_from(os.getenv(_ALLOWED_CHANNELS_ENV, ""))
+
+
+def _ignored_channels() -> set[str]:
+    return _channel_ids_from(os.getenv(_IGNORED_CHANNELS_ENV, ""))
+
+
+def _free_response_channels() -> set[str]:
+    return _channel_ids_from(os.getenv(_FREE_RESPONSE_CHANNELS_ENV, ""))
+
+
+def _no_thread_channels() -> set[str]:
+    return _channel_ids_from(os.getenv(_NO_THREAD_CHANNELS_ENV, ""))
+
+
+def _require_mention() -> bool:
+    return _env_bool(_REQUIRE_MENTION_ENV, True)
+
+
+def _thread_require_mention() -> bool:
+    return _env_bool(_THREAD_REQUIRE_MENTION_ENV, False)
+
+
+def _channel_set_matches(channels: set[str], chat_id: str) -> bool:
+    cid = str(chat_id or "").strip()
+    return "*" in channels or bool(cid and cid in channels)
 
 
 def _normalize_allowed_user_emails_env() -> None:
@@ -702,10 +764,13 @@ class RingCentralAdapter(BasePlatformAdapter):
 
     def _initial_thread_target(
         self,
+        chat_id: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> tuple[Optional[str], Optional[str]]:
         if self._reply_to_mode == "off":
+            return None, None
+        if _channel_set_matches(_no_thread_channels(), chat_id):
             return None, None
 
         metadata_parent_post_id, metadata_thread_id = self._thread_target_from_metadata(metadata)
@@ -736,7 +801,11 @@ class RingCentralAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(content, MAX_POST_LENGTH)
         identity = preferred_identity
         last_id: Optional[str] = None
-        parent_post_id, active_thread_id = self._initial_thread_target(reply_to, metadata)
+        parent_post_id, active_thread_id = self._initial_thread_target(
+            chat_id,
+            reply_to,
+            metadata,
+        )
         if parent_post_id or active_thread_id:
             logger.info(
                 "RingCentral: sending threaded reply: chat=%s parentPostId=%s "
@@ -1244,6 +1313,24 @@ class RingCentralAdapter(BasePlatformAdapter):
         normalized = _normalize_email(email)
         return bool(normalized and self._owner_email and normalized == self._owner_email)
 
+    def _channel_gate_rejection(self, chat_id: str, chat_type: str) -> Optional[str]:
+        if chat_type == "dm":
+            return None
+        cid = str(chat_id or "").strip()
+        allowed = _allowed_channels()
+        if allowed and not _channel_set_matches(allowed, cid):
+            return f"chat not in {_ALLOWED_CHANNELS_ENV}"
+        ignored = _ignored_channels()
+        if _channel_set_matches(ignored, cid):
+            return f"chat in {_IGNORED_CHANNELS_ENV}"
+        return None
+
+    def _free_response_chat(self, chat_id: str, chat_type: str) -> bool:
+        return chat_type != "dm" and _channel_set_matches(
+            _free_response_channels(),
+            chat_id,
+        )
+
     def _thread_followup_trigger(
         self,
         thread_id: str,
@@ -1265,6 +1352,23 @@ class RingCentralAdapter(BasePlatformAdapter):
         if parent_post_id:
             return self._parent_thread_value(parent_post_id)
         return None
+
+    def _group_message_triggers(
+        self,
+        chat_id: str,
+        chat_type: str,
+        addressed_explicit: bool,
+        thread_followup_trigger: bool,
+    ) -> bool:
+        if chat_type == "dm":
+            return True
+        if addressed_explicit:
+            return True
+        if self._free_response_chat(chat_id, chat_type):
+            return True
+        if not _require_mention():
+            return True
+        return bool(thread_followup_trigger and not _thread_require_mention())
 
     def _is_bot_dm_chat(
         self,
@@ -2214,13 +2318,35 @@ class RingCentralAdapter(BasePlatformAdapter):
                 )
             return
 
+        channel_rejection = self._channel_gate_rejection(chat_id, chat_type)
+        if channel_rejection:
+            logger.info(
+                "RingCentral: dropping message due to channel gate: chat=%s "
+                "sender=%s reason=%s",
+                chat_id,
+                creator_id,
+                channel_rejection,
+            )
+            return
+
+        thread_followup_trigger = self._thread_followup_trigger(
+            thread_id,
+            parent_post_id,
+        )
+        group_trigger = self._group_message_triggers(
+            chat_id,
+            chat_type,
+            addressed_explicit,
+            thread_followup_trigger,
+        )
+
         if summary_request:
             owner_ready = bool(
                 self._owner_client is not None
                 and self._owner_person_id
                 and self._owner_email
             )
-            visible_trigger = chat_type == "dm" or addressed_explicit or text.strip().startswith("/")
+            visible_trigger = group_trigger or text.strip().startswith("/")
             if not owner_ready:
                 if visible_trigger:
                     logger.info(
@@ -2272,15 +2398,10 @@ class RingCentralAdapter(BasePlatformAdapter):
                 )
                 return
 
-        thread_followup_trigger = self._thread_followup_trigger(
-            thread_id,
-            parent_post_id,
-        )
-
         # Owner WS observes many chats. In groups, require an explicit bot
         # mention or an existing participated thread; arbitrary slash commands
         # in owner-visible groups must not trigger Hermes.
-        if chat_type != "dm" and not (addressed_explicit or thread_followup_trigger):
+        if chat_type != "dm" and not group_trigger:
             logger.debug(
                 "RingCentral: skipping un-addressed group message in %s", chat_id,
             )
@@ -2498,6 +2619,7 @@ async def _standalone_send(
         return {"error": "RingCentral standalone send: RC_BOT_TOKEN must be set"}
     if not chat_id:
         return {"error": "RingCentral standalone send: chat_id is required"}
+    thread_result_hint = "" if _channel_set_matches(_no_thread_channels(), chat_id) else (thread_id or "")
 
     client = RingCentralClient(token, server_url)
     owner_client: Optional[RingCentralClient] = None
@@ -2525,9 +2647,12 @@ async def _standalone_send(
         return None
 
     async def _post() -> tuple[Optional[Dict[str, Any]], str]:
-        parent_post_id, target_thread_id = RingCentralAdapter._thread_target_from_metadata({
-            "thread_id": thread_id,
-        })
+        if _channel_set_matches(_no_thread_channels(), chat_id):
+            parent_post_id, target_thread_id = None, None
+        else:
+            parent_post_id, target_thread_id = RingCentralAdapter._thread_target_from_metadata({
+                "thread_id": thread_id,
+            })
         if parent_post_id:
             thread_kwargs = {"parent_post_id": parent_post_id}
         elif target_thread_id:
@@ -2571,7 +2696,7 @@ async def _standalone_send(
             "chat_id": chat_id,
             "message_id": str(data["id"]),
             "identity": identity,
-            "thread_id": str(data.get("threadId") or thread_id or ""),
+            "thread_id": str(data.get("threadId") or thread_result_hint or ""),
         }
     except Exception as exc:  # noqa: BLE001
         return {"error": f"RingCentral standalone send failed: {exc}"}
