@@ -75,6 +75,7 @@ _SUMMARY_CONTEXT_CHAR_LIMIT = 60000
 _SUMMARY_TARGET_CONFIDENCE_THRESHOLD = 0.5
 _DEFAULT_REPLY_TO_MODE = "first"
 _REPLY_TO_MODES = {"off", "first", "all"}
+_PARENT_THREAD_PREFIX = "parentPostId:"
 
 _SUMMARY_TARGET_INTENT_SCHEMA = {
     "type": "object",
@@ -480,6 +481,18 @@ class RingCentralAdapter(BasePlatformAdapter):
             return self._owner_client
         return self._client
 
+    def _mark_participated_thread(self, thread_id: Optional[str]) -> None:
+        if not thread_id:
+            return
+        tid = str(thread_id)
+        mark = getattr(self._threads, "mark", None)
+        if callable(mark):
+            mark(tid)
+            return
+        add = getattr(self._threads, "add", None)
+        if callable(add):
+            add(tid)
+
     def _record_outbound_post(
         self,
         post_id: str,
@@ -491,7 +504,7 @@ class RingCentralAdapter(BasePlatformAdapter):
             return
         self._sent_message_identity[str(post_id)] = identity
         if thread_id:
-            self._threads.mark(str(thread_id))
+            self._mark_participated_thread(str(thread_id))
         # Either WS may see the post depending on chat membership. Mark both.
         for ws in (self._ws, self._owner_ws):
             if ws is not None:
@@ -523,8 +536,28 @@ class RingCentralAdapter(BasePlatformAdapter):
         post_id = str(data.get("id") or "")
         if not post_id:
             return
-        thread_id = str(data.get("threadId") or fallback_thread_anchor or "").strip() or None
+        returned_thread_id = str(data.get("threadId") or "").strip()
+        fallback_anchor = str(fallback_thread_anchor or "").strip()
+        thread_id = returned_thread_id or fallback_anchor or None
         self._record_outbound_post(post_id, identity, thread_id=thread_id)
+        if returned_thread_id and fallback_anchor and fallback_anchor != returned_thread_id:
+            self._mark_participated_thread(fallback_anchor)
+
+    @staticmethod
+    def _log_threaded_send_response(
+        chat_id: str,
+        data: Dict[str, Any],
+        identity: str,
+    ) -> None:
+        logger.info(
+            "RingCentral: threaded send response: chat=%s post=%s "
+            "parentPostId=%s threadId=%s identity=%s",
+            chat_id,
+            data.get("id") or "",
+            data.get("parentPostId") or "",
+            data.get("threadId") or "",
+            identity,
+        )
 
     async def _send_post_with_fallback(
         self,
@@ -556,6 +589,8 @@ class RingCentralAdapter(BasePlatformAdapter):
                 identity,
                 fallback_thread_anchor=thread_id or parent_post_id,
             )
+            if parent_post_id or thread_id:
+                self._log_threaded_send_response(chat_id, data, identity)
             return data, identity
 
         if (
@@ -576,6 +611,12 @@ class RingCentralAdapter(BasePlatformAdapter):
                     _IDENTITY_OWNER,
                     fallback_thread_anchor=thread_id or parent_post_id,
                 )
+                if parent_post_id or thread_id:
+                    self._log_threaded_send_response(
+                        chat_id,
+                        owner_data,
+                        _IDENTITY_OWNER,
+                    )
                 logger.info("RingCentral: sent via owner fallback in chat %s", chat_id)
                 return owner_data, _IDENTITY_OWNER
             if (
@@ -636,12 +677,28 @@ class RingCentralAdapter(BasePlatformAdapter):
         return None, _IDENTITY_BOT
 
     @staticmethod
-    def _metadata_thread_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    def _parent_thread_value(parent_post_id: str) -> str:
+        return f"{_PARENT_THREAD_PREFIX}{parent_post_id}"
+
+    @staticmethod
+    def _thread_target_from_metadata(
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[str]]:
         if not metadata:
-            return None
+            return None, None
         raw = metadata.get("thread_id") or metadata.get("threadId")
         value = str(raw or "").strip()
-        return value or None
+        if not value:
+            return None, None
+        if value.startswith(_PARENT_THREAD_PREFIX):
+            parent_post_id = value[len(_PARENT_THREAD_PREFIX):].strip()
+            return (parent_post_id or None), None
+        return None, value
+
+    @staticmethod
+    def _metadata_thread_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        _, thread_id = RingCentralAdapter._thread_target_from_metadata(metadata)
+        return thread_id
 
     def _initial_thread_target(
         self,
@@ -651,9 +708,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         if self._reply_to_mode == "off":
             return None, None
 
-        metadata_thread_id = self._metadata_thread_id(metadata)
-        if metadata_thread_id:
-            return None, metadata_thread_id
+        metadata_parent_post_id, metadata_thread_id = self._thread_target_from_metadata(metadata)
+        if metadata_parent_post_id or metadata_thread_id:
+            return metadata_parent_post_id, metadata_thread_id
 
         reply_to_id = str(reply_to or "").strip()
         if not reply_to_id:
@@ -680,6 +737,16 @@ class RingCentralAdapter(BasePlatformAdapter):
         identity = preferred_identity
         last_id: Optional[str] = None
         parent_post_id, active_thread_id = self._initial_thread_target(reply_to, metadata)
+        if parent_post_id or active_thread_id:
+            logger.info(
+                "RingCentral: sending threaded reply: chat=%s parentPostId=%s "
+                "threadId=%s mode=%s identity=%s",
+                chat_id,
+                parent_post_id or "",
+                active_thread_id or "",
+                self._reply_to_mode,
+                identity,
+            )
         for chunk in chunks:
             data, identity = await self._send_post_with_fallback(
                 chat_id,
@@ -1176,6 +1243,28 @@ class RingCentralAdapter(BasePlatformAdapter):
     def _is_owner_email(self, email: str) -> bool:
         normalized = _normalize_email(email)
         return bool(normalized and self._owner_email and normalized == self._owner_email)
+
+    def _thread_followup_trigger(
+        self,
+        thread_id: str,
+        parent_post_id: str,
+    ) -> bool:
+        thread_hit = bool(thread_id and thread_id in self._threads)
+        parent_hit = bool(parent_post_id and parent_post_id in self._threads)
+        if parent_hit and thread_id and not thread_hit:
+            self._mark_participated_thread(thread_id)
+        return thread_hit or parent_hit
+
+    def _source_thread_id(
+        self,
+        thread_id: str,
+        parent_post_id: str,
+    ) -> Optional[str]:
+        if thread_id:
+            return thread_id
+        if parent_post_id:
+            return self._parent_thread_value(parent_post_id)
+        return None
 
     def _is_bot_dm_chat(
         self,
@@ -2183,10 +2272,9 @@ class RingCentralAdapter(BasePlatformAdapter):
                 )
                 return
 
-        thread_followup_trigger = bool(
-            thread_id
-            and parent_post_id
-            and (thread_id in self._threads or parent_post_id in self._threads)
+        thread_followup_trigger = self._thread_followup_trigger(
+            thread_id,
+            parent_post_id,
         )
 
         # Owner WS observes many chats. In groups, require an explicit bot
@@ -2230,7 +2318,7 @@ class RingCentralAdapter(BasePlatformAdapter):
             user_id=sender_email or creator_id,
             user_name=sender_name,
             user_id_alt=creator_id,
-            thread_id=thread_id or None,
+            thread_id=self._source_thread_id(thread_id, parent_post_id),
             message_id=post_id or None,
         )
 
@@ -2437,7 +2525,15 @@ async def _standalone_send(
         return None
 
     async def _post() -> tuple[Optional[Dict[str, Any]], str]:
-        thread_kwargs = {"thread_id": thread_id} if thread_id else {}
+        parent_post_id, target_thread_id = RingCentralAdapter._thread_target_from_metadata({
+            "thread_id": thread_id,
+        })
+        if parent_post_id:
+            thread_kwargs = {"parent_post_id": parent_post_id}
+        elif target_thread_id:
+            thread_kwargs = {"thread_id": target_thread_id}
+        else:
+            thread_kwargs = {}
         data = await client.send_post(chat_id, message or "", **thread_kwargs)
         if data and data.get("id"):
             return data, _IDENTITY_BOT
