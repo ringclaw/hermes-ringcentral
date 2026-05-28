@@ -32,9 +32,9 @@ optional_env:
     description: "Owner JWT token. Optional; only used with RC_USER_CLIENT_ID and RC_USER_CLIENT_SECRET."
     prompt: "Owner JWT token"
     password: true
-  - name: RC_ALLOWED_USERS
-    description: "Comma-separated RingCentral person IDs allowed to talk to the bot. If omitted and owner mode is configured, the owner ID is auto-seeded."
-    prompt: "Allowed user IDs (comma-separated)"
+  - name: RC_ALLOWED_USER_EMAILS
+    description: "Comma/semicolon-separated RingCentral user emails allowed to talk to the bot. If omitted and owner mode is configured, the owner email is auto-seeded."
+    prompt: "Allowed user emails (comma-separated)"
     password: false
   - name: RC_ALLOW_ALL_USERS
     description: "Allow any RingCentral user to trigger the bot (dev only)"
@@ -43,6 +43,10 @@ optional_env:
   - name: RC_SUMMARY_MESSAGE_LIMIT
     description: "Recent messages to fetch with the owner token for DM-triggered chat summaries (default: 250, max: 1000)."
     prompt: "Summary message limit"
+    password: false
+  - name: RC_REPLY_TO_MODE
+    description: "Threaded reply mode for RingCentral posts: first (default), all, or off."
+    prompt: "Reply-to mode"
     password: false
   - name: RC_HOME_CHANNEL
     description: "Default chat/group ID for cron / notification delivery"

@@ -16,7 +16,7 @@ Configure via env vars::
     RC_USER_CLIENT_SECRET  Owner app client secret (optional)
     RC_USER_JWT_TOKEN      Owner JWT token (optional)
     RC_SERVER_URL          API base URL (default https://platform.ringcentral.com)
-    RC_ALLOWED_USERS       Comma-separated allowed RC person IDs
+    RC_ALLOWED_USER_EMAILS Comma/semicolon-separated allowed RC user emails
     RC_ALLOW_ALL_USERS     true/false — open access (dev only)
     RC_HOME_CHANNEL        Default chat ID for cron / notification delivery
     RC_HOME_CHANNEL_NAME   Display name for the home chat
@@ -44,7 +44,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 
 from .rc_client import DEFAULT_SERVER_URL, RingCentralClient
 from .rc_ws import RingCentralWebSocket
@@ -64,12 +64,17 @@ _IDENTITY_BOT = "bot"
 _IDENTITY_OWNER = "owner"
 
 _PERMISSION_FALLBACK_STATUSES = {401, 403, 404}
+_ALLOWED_USER_EMAILS_ENV = "RC_ALLOWED_USER_EMAILS"
+_LEGACY_ALLOWED_USERS_ENV = "RC_ALLOWED_USERS"
+_ALLOW_ALL_USERS_ENV = "RC_ALLOW_ALL_USERS"
 
 _SUMMARY_KEYWORDS = ("summarize", "summarise", "summary", "总结")
 _DEFAULT_SUMMARY_MESSAGE_LIMIT = 250
 _MAX_SUMMARY_MESSAGE_LIMIT = 1000
 _SUMMARY_CONTEXT_CHAR_LIMIT = 60000
 _SUMMARY_TARGET_CONFIDENCE_THRESHOLD = 0.5
+_DEFAULT_REPLY_TO_MODE = "first"
+_REPLY_TO_MODES = {"off", "first", "all"}
 
 _SUMMARY_TARGET_INTENT_SCHEMA = {
     "type": "object",
@@ -185,6 +190,39 @@ def _truthy(raw: Any) -> bool:
     return str(raw or "").strip().lower() in {"true", "1", "yes", "on"}
 
 
+def _normalize_email(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return value if "@" in value else ""
+
+
+def _email_allowlist_from(raw: Any) -> set[str]:
+    if isinstance(raw, list):
+        parts: List[str] = []
+        for item in raw:
+            parts.extend(re.split(r"[;,]", str(item or "")))
+    else:
+        parts = re.split(r"[;,]", str(raw or ""))
+    return {email for part in parts if (email := _normalize_email(part))}
+
+
+def _allowed_user_emails() -> set[str]:
+    return _email_allowlist_from(os.getenv(_ALLOWED_USER_EMAILS_ENV, ""))
+
+
+def _normalize_allowed_user_emails_env() -> None:
+    legacy = os.getenv(_LEGACY_ALLOWED_USERS_ENV, "").strip()
+    if legacy:
+        logger.warning(
+            "RingCentral: %s is ignored; use %s with email addresses",
+            _LEGACY_ALLOWED_USERS_ENV,
+            _ALLOWED_USER_EMAILS_ENV,
+        )
+    raw = os.getenv(_ALLOWED_USER_EMAILS_ENV, "")
+    emails = _email_allowlist_from(raw)
+    if emails:
+        os.environ[_ALLOWED_USER_EMAILS_ENV] = ",".join(sorted(emails))
+
+
 def _summary_message_limit_from(extra: Dict[str, Any]) -> int:
     raw = (
         extra.get("summary_message_limit")
@@ -200,6 +238,25 @@ def _summary_message_limit_from(extra: Dict[str, Any]) -> int:
     if value <= 0:
         return _DEFAULT_SUMMARY_MESSAGE_LIMIT
     return min(max(value, 1), _MAX_SUMMARY_MESSAGE_LIMIT)
+
+
+def _reply_to_mode_from(extra: Dict[str, Any]) -> str:
+    raw = (
+        extra.get("reply_to_mode")
+        or os.getenv("RC_REPLY_TO_MODE", "")
+        or ""
+    )
+    if not raw and "reply_in_thread" in extra:
+        raw = "first" if _truthy(extra.get("reply_in_thread")) else "off"
+    mode = str(raw or _DEFAULT_REPLY_TO_MODE).strip().lower()
+    if mode not in _REPLY_TO_MODES:
+        logger.warning(
+            "RingCentral: invalid reply_to_mode %r; using %s",
+            raw,
+            _DEFAULT_REPLY_TO_MODE,
+        )
+        return _DEFAULT_REPLY_TO_MODE
+    return mode
 
 
 def _summary_query_from_text(text: str) -> Optional[str]:
@@ -375,6 +432,7 @@ class RingCentralAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig, intent_llm: Any = None):
         super().__init__(config, _RC_PLATFORM)
+        _normalize_allowed_user_emails_env()
 
         extra = getattr(config, "extra", {}) or {}
         self._intent_llm = intent_llm
@@ -391,6 +449,7 @@ class RingCentralAdapter(BasePlatformAdapter):
         )
         self._owner_credentials = _owner_credentials_from(extra)
         self._summary_message_limit = _summary_message_limit_from(extra)
+        self._reply_to_mode = _reply_to_mode_from(extra)
 
         self._client: Optional[RingCentralClient] = None
         self._owner_client: Optional[RingCentralClient] = None
@@ -401,6 +460,7 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._own_name: str = ""
         self._owner_person_id: str = ""
         self._owner_name: str = ""
+        self._owner_email: str = ""
         self._owner_only_gate_enabled = False
 
         # RC permits edit/delete only by the identity that created the post.
@@ -409,6 +469,7 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._sent_message_identity: Dict[str, str] = {}
 
         self._dedup = MessageDeduplicator()
+        self._threads = ThreadParticipationTracker("ringcentral")
 
     @property
     def name(self) -> str:
@@ -419,14 +480,51 @@ class RingCentralAdapter(BasePlatformAdapter):
             return self._owner_client
         return self._client
 
-    def _record_outbound_post(self, post_id: str, identity: str) -> None:
+    def _record_outbound_post(
+        self,
+        post_id: str,
+        identity: str,
+        *,
+        thread_id: Optional[str] = None,
+    ) -> None:
         if not post_id:
             return
         self._sent_message_identity[str(post_id)] = identity
+        if thread_id:
+            self._threads.mark(str(thread_id))
         # Either WS may see the post depending on chat membership. Mark both.
         for ws in (self._ws, self._owner_ws):
             if ws is not None:
                 ws.mark_own_post(str(post_id))
+
+    async def _client_send_post(
+        self,
+        client: RingCentralClient,
+        chat_id: str,
+        text: str,
+        *,
+        parent_post_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        kwargs: Dict[str, str] = {}
+        if parent_post_id:
+            kwargs["parent_post_id"] = str(parent_post_id)
+        elif thread_id:
+            kwargs["thread_id"] = str(thread_id)
+        return await client.send_post(chat_id, text, **kwargs)
+
+    def _record_sent_post_response(
+        self,
+        data: Dict[str, Any],
+        identity: str,
+        *,
+        fallback_thread_anchor: Optional[str] = None,
+    ) -> None:
+        post_id = str(data.get("id") or "")
+        if not post_id:
+            return
+        thread_id = str(data.get("threadId") or fallback_thread_anchor or "").strip() or None
+        self._record_outbound_post(post_id, identity, thread_id=thread_id)
 
     async def _send_post_with_fallback(
         self,
@@ -434,6 +532,8 @@ class RingCentralAdapter(BasePlatformAdapter):
         text: str,
         *,
         preferred_identity: str = _IDENTITY_BOT,
+        parent_post_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> tuple[Optional[Dict[str, Any]], str]:
         identity = preferred_identity
         client = self._client_for_identity(identity)
@@ -443,9 +543,19 @@ class RingCentralAdapter(BasePlatformAdapter):
         if client is None:
             return None, identity
 
-        data = await client.send_post(chat_id, text)
+        data = await self._client_send_post(
+            client,
+            chat_id,
+            text,
+            parent_post_id=parent_post_id,
+            thread_id=thread_id,
+        )
         if data and data.get("id"):
-            self._record_outbound_post(str(data["id"]), identity)
+            self._record_sent_post_response(
+                data,
+                identity,
+                fallback_thread_anchor=thread_id or parent_post_id,
+            )
             return data, identity
 
         if (
@@ -453,11 +563,47 @@ class RingCentralAdapter(BasePlatformAdapter):
             and self._owner_client is not None
             and _is_permission_failure(client)
         ):
-            owner_data = await self._owner_client.send_post(chat_id, text)
+            owner_data = await self._client_send_post(
+                self._owner_client,
+                chat_id,
+                text,
+                parent_post_id=parent_post_id,
+                thread_id=thread_id,
+            )
             if owner_data and owner_data.get("id"):
-                self._record_outbound_post(str(owner_data["id"]), _IDENTITY_OWNER)
+                self._record_sent_post_response(
+                    owner_data,
+                    _IDENTITY_OWNER,
+                    fallback_thread_anchor=thread_id or parent_post_id,
+                )
                 logger.info("RingCentral: sent via owner fallback in chat %s", chat_id)
                 return owner_data, _IDENTITY_OWNER
+            if (
+                (parent_post_id or thread_id)
+                and self._owner_client is not None
+                and not _is_permission_failure(self._owner_client)
+            ):
+                owner_plain = await self._owner_client.send_post(chat_id, text)
+                if owner_plain and owner_plain.get("id"):
+                    self._record_sent_post_response(owner_plain, _IDENTITY_OWNER)
+                    logger.warning(
+                        "RingCentral: threaded owner fallback failed in chat %s; "
+                        "sent unthreaded",
+                        chat_id,
+                    )
+                    return owner_plain, _IDENTITY_OWNER
+
+            return None, identity
+
+        if (parent_post_id or thread_id) and not _is_permission_failure(client):
+            plain_data = await client.send_post(chat_id, text)
+            if plain_data and plain_data.get("id"):
+                self._record_sent_post_response(plain_data, identity)
+                logger.warning(
+                    "RingCentral: threaded send failed in chat %s; sent unthreaded",
+                    chat_id,
+                )
+                return plain_data, identity
 
         return None, identity
 
@@ -489,12 +635,43 @@ class RingCentralAdapter(BasePlatformAdapter):
 
         return None, _IDENTITY_BOT
 
+    @staticmethod
+    def _metadata_thread_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not metadata:
+            return None
+        raw = metadata.get("thread_id") or metadata.get("threadId")
+        value = str(raw or "").strip()
+        return value or None
+
+    def _initial_thread_target(
+        self,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[str]]:
+        if self._reply_to_mode == "off":
+            return None, None
+
+        metadata_thread_id = self._metadata_thread_id(metadata)
+        if metadata_thread_id:
+            return None, metadata_thread_id
+
+        reply_to_id = str(reply_to or "").strip()
+        if not reply_to_id:
+            return None, None
+
+        if self._reply_to_mode == "first" and reply_to_id in self._sent_message_identity:
+            return None, None
+
+        return reply_to_id, None
+
     async def _send_chunks(
         self,
         chat_id: str,
         content: str,
         *,
         preferred_identity: str = _IDENTITY_BOT,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if not content:
             return SendResult(success=True)
@@ -502,20 +679,30 @@ class RingCentralAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(content, MAX_POST_LENGTH)
         identity = preferred_identity
         last_id: Optional[str] = None
+        parent_post_id, active_thread_id = self._initial_thread_target(reply_to, metadata)
         for chunk in chunks:
             data, identity = await self._send_post_with_fallback(
                 chat_id,
                 chunk,
                 preferred_identity=identity,
+                parent_post_id=parent_post_id if not active_thread_id else None,
+                thread_id=active_thread_id,
             )
             if not data or not data.get("id"):
                 return SendResult(success=False, error="Failed to create post")
             last_id = str(data["id"])
+            returned_thread_id = str(data.get("threadId") or "").strip()
+            if returned_thread_id:
+                active_thread_id = returned_thread_id
+                parent_post_id = None
 
         return SendResult(
             success=True,
             message_id=last_id,
-            raw_response={"identity": identity},
+            raw_response={
+                "identity": identity,
+                "thread_id": active_thread_id,
+            },
         )
 
     # ── Connection lifecycle ──────────────────────────────────────────────
@@ -634,29 +821,43 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._owner_client = owner
         self._owner_person_id = str(owner.owner_id or ext.get("id"))
         contact = ext.get("contact") or {}
+        self._owner_email = _normalize_email(contact.get("email"))
+        if not self._owner_email and self._owner_person_id:
+            try:
+                person = await owner.get_person(self._owner_person_id)
+            except Exception as exc:
+                logger.debug("RingCentral: owner person lookup failed: %s", exc)
+                person = None
+            if isinstance(person, dict):
+                self._owner_email = _normalize_email(person.get("email"))
         self._owner_name = (
             contact.get("firstName")
             or ext.get("name")
+            or self._owner_email
             or "RingCentral Owner"
         )
         self._seed_owner_allowlist()
         logger.info(
-            "RingCentral: owner mode authenticated as %s (id=%s)",
+            "RingCentral: owner mode authenticated as %s (id=%s email=%s)",
             self._owner_name,
             self._owner_person_id,
+            self._owner_email or "unknown",
         )
 
     def _seed_owner_allowlist(self) -> None:
         """Let Hermes core enforce owner-only access when no allowlist exists."""
-        if not self._owner_person_id:
+        if not self._owner_email:
             return
-        if _truthy(os.getenv("RC_ALLOW_ALL_USERS", "")):
+        if _truthy(os.getenv(_ALLOW_ALL_USERS_ENV, "")):
             return
-        if os.getenv("RC_ALLOWED_USERS", "").strip():
+        if os.getenv(_ALLOWED_USER_EMAILS_ENV, "").strip():
             return
-        os.environ["RC_ALLOWED_USERS"] = self._owner_person_id
+        os.environ[_ALLOWED_USER_EMAILS_ENV] = self._owner_email
         self._owner_only_gate_enabled = True
-        logger.info("RingCentral: RC_ALLOWED_USERS auto-seeded from owner identity")
+        logger.info(
+            "RingCentral: %s auto-seeded from owner email",
+            _ALLOWED_USER_EMAILS_ENV,
+        )
 
     # ── Sending ───────────────────────────────────────────────────────────
 
@@ -669,7 +870,12 @@ class RingCentralAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self._client is None:
             return SendResult(success=False, error="Not connected")
-        return await self._send_chunks(chat_id, content)
+        return await self._send_chunks(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def send_typing(
         self,
@@ -718,7 +924,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Download ``image_url`` and upload as a RC file attachment."""
-        return await self._send_url_as_file(chat_id, image_url, caption, kind="image")
+        return await self._send_url_as_file(
+            chat_id, image_url, caption, kind="image", reply_to=reply_to, metadata=metadata,
+        )
 
     async def send_image_file(
         self,
@@ -728,7 +936,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._send_local_file(chat_id, image_path, caption)
+        return await self._send_local_file(
+            chat_id, image_path, caption, reply_to=reply_to, metadata=metadata,
+        )
 
     async def send_document(
         self,
@@ -739,7 +949,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._send_local_file(chat_id, file_path, caption, file_name)
+        return await self._send_local_file(
+            chat_id, file_path, caption, file_name, reply_to=reply_to, metadata=metadata,
+        )
 
     async def send_voice(
         self,
@@ -749,7 +961,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._send_local_file(chat_id, audio_path, caption)
+        return await self._send_local_file(
+            chat_id, audio_path, caption, reply_to=reply_to, metadata=metadata,
+        )
 
     async def send_video(
         self,
@@ -759,7 +973,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._send_local_file(chat_id, video_path, caption)
+        return await self._send_local_file(
+            chat_id, video_path, caption, reply_to=reply_to, metadata=metadata,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic chat info — name + type."""
@@ -818,6 +1034,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         url: str,
         caption: Optional[str],
         kind: str = "file",
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """SSRF-safe URL fetch → RC file upload → post with attachment."""
         if self._client is None:
@@ -826,7 +1045,12 @@ class RingCentralAdapter(BasePlatformAdapter):
         from tools.url_safety import is_safe_url
         if not is_safe_url(url):
             logger.warning("RingCentral: blocked unsafe URL (SSRF protection)")
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip())
+            return await self.send(
+                chat_id,
+                f"{caption or ''}\n{url}".strip(),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         import aiohttp
 
@@ -835,12 +1059,22 @@ class RingCentralAdapter(BasePlatformAdapter):
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status >= 400:
-                    return await self.send(chat_id, f"{caption or ''}\n{url}".strip())
+                    return await self.send(
+                        chat_id,
+                        f"{caption or ''}\n{url}".strip(),
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
                 file_data = await resp.read()
                 content_type = resp.content_type or _content_type_for_filename(filename)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning("RingCentral: download failed for %s: %s", url[:80], exc)
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip())
+            return await self.send(
+                chat_id,
+                f"{caption or ''}\n{url}".strip(),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         upload, identity = await self._upload_file_with_fallback(
             chat_id,
@@ -849,7 +1083,12 @@ class RingCentralAdapter(BasePlatformAdapter):
             content_type,
         )
         if not upload:
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip())
+            return await self.send(
+                chat_id,
+                f"{caption or ''}\n{url}".strip(),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         # RC's file endpoint posts the attachment as part of the upload —
         # but it leaves the caption empty. Send the caption as a follow-up
@@ -859,6 +1098,8 @@ class RingCentralAdapter(BasePlatformAdapter):
                 chat_id,
                 caption,
                 preferred_identity=identity,
+                reply_to=reply_to,
+                metadata=metadata,
             )
             if not cap_result.success:
                 return cap_result
@@ -871,6 +1112,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str],
         file_name: Optional[str] = None,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if self._client is None:
             return SendResult(success=False, error="Not connected")
@@ -894,7 +1138,13 @@ class RingCentralAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="File upload failed")
 
         if caption:
-            return await self._send_chunks(chat_id, caption, preferred_identity=identity)
+            return await self._send_chunks(
+                chat_id,
+                caption,
+                preferred_identity=identity,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
         return SendResult(success=True, message_id=str(upload.get("id") or ""))
 
     # ── Inbound WebSocket events ──────────────────────────────────────────
@@ -906,14 +1156,42 @@ class RingCentralAdapter(BasePlatformAdapter):
         await self._handle_ws_event(body, identity=_IDENTITY_OWNER)
 
     def _owner_only_gate_active(self) -> bool:
-        if not self._owner_person_id:
+        if not self._owner_email:
             return False
-        if _truthy(os.getenv("RC_ALLOW_ALL_USERS", "")):
+        if _truthy(os.getenv(_ALLOW_ALL_USERS_ENV, "")):
             return False
-        allowed = _csv_set(os.getenv("RC_ALLOWED_USERS", ""))
-        return self._owner_only_gate_enabled or allowed == {self._owner_person_id}
+        allowed = _allowed_user_emails()
+        return self._owner_only_gate_enabled or allowed == {self._owner_email}
 
-    async def _resolve_sender_name(self, person_id: str, identity: str) -> str:
+    def _is_sender_authorized_email(self, email: str) -> bool:
+        if _truthy(os.getenv(_ALLOW_ALL_USERS_ENV, "")):
+            return True
+        normalized = _normalize_email(email)
+        if not normalized:
+            return False
+        if self._owner_email and normalized == self._owner_email:
+            return True
+        return normalized in _allowed_user_emails()
+
+    def _is_owner_email(self, email: str) -> bool:
+        normalized = _normalize_email(email)
+        return bool(normalized and self._owner_email and normalized == self._owner_email)
+
+    def _is_bot_dm_chat(
+        self,
+        chat_id: str,
+        chat_info: Dict[str, Any],
+        *,
+        identity: str,
+    ) -> bool:
+        if (chat_info.get("type") or "") != "dm":
+            return False
+        if identity == _IDENTITY_BOT:
+            return True
+        member_ids = set(chat_info.get("member_ids") or [])
+        return bool(self._own_person_id and self._own_person_id in member_ids)
+
+    async def _resolve_sender_profile(self, person_id: str, identity: str) -> Dict[str, str]:
         clients = [self._client_for_identity(identity)]
         if identity != _IDENTITY_BOT:
             clients.append(self._client)
@@ -925,15 +1203,24 @@ class RingCentralAdapter(BasePlatformAdapter):
             if client is None or id(client) in seen:
                 continue
             seen.add(id(client))
-            sender_user = await client.get_person(person_id)
+            try:
+                sender_user = await client.get_person(person_id)
+            except Exception as exc:
+                logger.debug("RingCentral: sender person lookup failed for %s: %s", person_id, exc)
+                sender_user = None
             if sender_user:
-                return (
+                email = _normalize_email(sender_user.get("email"))
+                name = (
                     sender_user.get("firstName")
                     or sender_user.get("displayName")
-                    or sender_user.get("email")
+                    or email
                     or person_id
                 )
-        return person_id
+                return {"name": str(name), "email": email}
+        return {"name": person_id, "email": ""}
+
+    async def _resolve_sender_name(self, person_id: str, identity: str) -> str:
+        return (await self._resolve_sender_profile(person_id, identity))["name"]
 
     def _shared_group_source(
         self,
@@ -1050,12 +1337,26 @@ class RingCentralAdapter(BasePlatformAdapter):
         return "dm" if ctype in {"direct", "personal"} else "group"
 
     @staticmethod
+    def _chat_member_ids(chat: Dict[str, Any]) -> set[str]:
+        members = chat.get("members") or []
+        ids: set[str] = set()
+        for member in members:
+            if isinstance(member, dict):
+                mid = str(member.get("id") or "").strip()
+            else:
+                mid = str(member or "").strip()
+            if mid:
+                ids.add(mid)
+        return ids
+
+    @staticmethod
     def _chat_info_from_record(chat: Dict[str, Any]) -> Dict[str, Any]:
         chat_id = _rc_chat_id_from(chat)
         return {
             "name": chat.get("name") or chat_id,
             "type": RingCentralAdapter._chat_kind(chat),
             "chat_id": chat_id,
+            "member_ids": RingCentralAdapter._chat_member_ids(chat),
             "raw": chat,
         }
 
@@ -1601,22 +1902,27 @@ class RingCentralAdapter(BasePlatformAdapter):
         origin_chat_info: Dict[str, Any],
         creator_id: str,
         sender_name: str,
+        sender_email: str,
         post_id: str,
         raw_text: str,
         clean_text: str,
         body: Dict[str, Any],
     ) -> None:
-        if self._owner_client is None or not self._owner_person_id:
+        if self._owner_client is None or not self._owner_person_id or not self._owner_email:
             await self._send_summary_notice(
                 origin_chat_id,
                 "RingCentral chat summary requires RC_USER_CLIENT_ID, "
                 "RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN.",
             )
             return
-        if creator_id != self._owner_person_id:
-            await self._send_summary_notice(
+        if not self._is_owner_email(sender_email):
+            logger.info(
+                "RingCentral: summary command ignored for non-owner email: "
+                "chat=%s sender=%s email=%s owner_email=%s",
                 origin_chat_id,
-                "Only the RingCentral owner can use chat summary.",
+                creator_id,
+                sender_email or "unknown",
+                self._owner_email or "unknown",
             )
             return
 
@@ -1693,8 +1999,9 @@ class RingCentralAdapter(BasePlatformAdapter):
             chat_id=origin_chat_id,
             chat_name=origin_chat_info.get("name"),
             chat_type="dm",
-            user_id=creator_id,
+            user_id=sender_email or creator_id,
             user_name=sender_name,
+            user_id_alt=creator_id,
             message_id=post_id or None,
         )
         request_text = (clean_text or raw_text or "").strip()
@@ -1755,6 +2062,8 @@ class RingCentralAdapter(BasePlatformAdapter):
         creator_id = str(body.get("creatorId") or "")
         raw_text = body.get("text") or ""
         attachments = body.get("attachments") or []
+        thread_id = str(body.get("threadId") or "").strip()
+        parent_post_id = str(body.get("parentPostId") or "").strip()
 
         if not chat_id:
             if _is_summary_request(str(raw_text or "")):
@@ -1776,6 +2085,14 @@ class RingCentralAdapter(BasePlatformAdapter):
         # the listing is stale or the chat is brand-new.
         chat_info = await self._get_chat_info(chat_id, preferred_identity=identity)
         chat_type = chat_info.get("type") or "group"
+        bot_dm_chat = self._is_bot_dm_chat(chat_id, chat_info, identity=identity)
+        if identity == _IDENTITY_OWNER and chat_type == "dm" and not bot_dm_chat:
+            logger.info(
+                "RingCentral: ignoring owner-visible non-bot DM: chat=%s creator=%s",
+                chat_id,
+                creator_id,
+            )
+            return
 
         # Decide whether the bot is addressed.
         addressed_explicit = bool(
@@ -1783,24 +2100,20 @@ class RingCentralAdapter(BasePlatformAdapter):
         )
         text = _strip_rc_mentions(raw_text, self._own_person_id)
 
-        sender_name = await self._resolve_sender_name(creator_id, identity)
+        sender_profile = await self._resolve_sender_profile(creator_id, identity)
+        sender_name = sender_profile["name"]
+        sender_email = sender_profile["email"]
         summary_request = _is_summary_request(text)
+        sender_authorized = self._is_sender_authorized_email(sender_email)
+        sender_is_owner = self._is_owner_email(sender_email)
 
-        owner_gate = self._owner_only_gate_active()
-        if owner_gate and creator_id != self._owner_person_id:
-            if summary_request:
-                logger.info(
-                    "RingCentral: summary command blocked for non-owner: "
-                    "chat=%s sender=%s owner=%s",
-                    chat_id,
-                    creator_id,
-                    self._owner_person_id,
-                )
-                if chat_type == "dm":
-                    await self._send_summary_notice(
-                        chat_id,
-                        "Only the RingCentral owner can use chat summary.",
-                    )
+        if not sender_authorized:
+            logger.info(
+                "RingCentral: dropping unauthorized sender: chat=%s sender=%s email=%s",
+                chat_id,
+                creator_id,
+                sender_email or "unknown",
+            )
             if chat_type != "dm":
                 self._observe_group_message(
                     chat_id=chat_id,
@@ -1810,12 +2123,14 @@ class RingCentralAdapter(BasePlatformAdapter):
                     sender_name=sender_name,
                     text=text,
                 )
-            else:
-                logger.debug("RingCentral: dropping non-owner DM from %s", creator_id)
             return
 
         if summary_request:
-            owner_ready = bool(self._owner_client is not None and self._owner_person_id)
+            owner_ready = bool(
+                self._owner_client is not None
+                and self._owner_person_id
+                and self._owner_email
+            )
             visible_trigger = chat_type == "dm" or addressed_explicit or text.strip().startswith("/")
             if not owner_ready:
                 if visible_trigger:
@@ -1831,19 +2146,15 @@ class RingCentralAdapter(BasePlatformAdapter):
                         "RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN.",
                     )
                 return
-            if creator_id != self._owner_person_id:
-                if visible_trigger:
-                    logger.info(
-                        "RingCentral: summary command blocked for non-owner: "
-                        "chat=%s sender=%s owner=%s",
-                        chat_id,
-                        creator_id,
-                        self._owner_person_id,
-                    )
-                    await self._send_summary_notice(
-                        chat_id,
-                        "Only the RingCentral owner can use chat summary.",
-                    )
+            if not sender_is_owner:
+                logger.info(
+                    "RingCentral: summary command ignored for non-owner: "
+                    "chat=%s sender=%s email=%s owner_email=%s",
+                    chat_id,
+                    creator_id,
+                    sender_email or "unknown",
+                    self._owner_email or "unknown",
+                )
                 return
             if chat_type == "dm":
                 await self._handle_owner_dm_summary_request(
@@ -1851,6 +2162,7 @@ class RingCentralAdapter(BasePlatformAdapter):
                     origin_chat_info=chat_info,
                     creator_id=creator_id,
                     sender_name=sender_name,
+                    sender_email=sender_email,
                     post_id=post_id,
                     raw_text=raw_text,
                     clean_text=text,
@@ -1871,15 +2183,16 @@ class RingCentralAdapter(BasePlatformAdapter):
                 )
                 return
 
-        owner_slash_trigger = bool(
-            owner_gate
-            and creator_id == self._owner_person_id
-            and text.strip().startswith("/")
+        thread_followup_trigger = bool(
+            thread_id
+            and parent_post_id
+            and (thread_id in self._threads or parent_post_id in self._threads)
         )
 
-        # In group chats, ignore messages that do not trigger the bot. DMs are
-        # always answered once Hermes authorization has passed.
-        if chat_type != "dm" and not (addressed_explicit or owner_slash_trigger):
+        # Owner WS observes many chats. In groups, require an explicit bot
+        # mention or an existing participated thread; arbitrary slash commands
+        # in owner-visible groups must not trigger Hermes.
+        if chat_type != "dm" and not (addressed_explicit or thread_followup_trigger):
             logger.debug(
                 "RingCentral: skipping un-addressed group message in %s", chat_id,
             )
@@ -1914,13 +2227,15 @@ class RingCentralAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_name=chat_info.get("name"),
             chat_type=chat_type,
-            user_id=creator_id,
+            user_id=sender_email or creator_id,
             user_name=sender_name,
+            user_id_alt=creator_id,
+            thread_id=thread_id or None,
             message_id=post_id or None,
         )
 
         channel_prompt = None
-        if owner_gate and creator_id == self._owner_person_id and chat_type != "dm":
+        if sender_is_owner and chat_type != "dm":
             observed_context = self._load_observed_context(chat_id, chat_info)
             text = self._wrap_with_observed_context(text, observed_context)
             channel_prompt = self._ringcentral_group_context_prompt()
@@ -1931,6 +2246,7 @@ class RingCentralAdapter(BasePlatformAdapter):
             source=source,
             raw_message=body,
             message_id=post_id or None,
+            reply_to_message_id=parent_post_id or None,
             media_urls=media_urls or None,
             media_types=media_types or None,
             channel_prompt=channel_prompt,
@@ -2003,6 +2319,7 @@ def _env_enablement() -> Optional[dict]:
     token = os.getenv("RC_BOT_TOKEN", "").strip()
     if not token:
         return None
+    _normalize_allowed_user_emails_env()
 
     seed: dict = {"token": token}
     server_url = os.getenv("RC_SERVER_URL", "").strip()
@@ -2069,9 +2386,8 @@ async def _standalone_send(
     ``hermes cron`` deliveries). Opens an ephemeral REST session, uploads
     any attached files into the target chat, posts the message, and exits.
 
-    ``thread_id`` is accepted for signature parity but unused — RingCentral
-    Team Messaging does not expose a threaded-reply primitive on posts.
-    ``force_document`` is accepted but unused for the same reason: every
+    ``thread_id`` routes text posts into an existing RingCentral thread.
+    ``force_document`` is accepted for signature parity but unused: every
     upload is a generic file attachment.
     """
     try:
@@ -2121,13 +2437,22 @@ async def _standalone_send(
         return None
 
     async def _post() -> tuple[Optional[Dict[str, Any]], str]:
-        data = await client.send_post(chat_id, message or "")
+        thread_kwargs = {"thread_id": thread_id} if thread_id else {}
+        data = await client.send_post(chat_id, message or "", **thread_kwargs)
         if data and data.get("id"):
             return data, _IDENTITY_BOT
         if owner_client is not None and _is_permission_failure(client):
-            owner_data = await owner_client.send_post(chat_id, message or "")
+            owner_data = await owner_client.send_post(
+                chat_id,
+                message or "",
+                **thread_kwargs,
+            )
             if owner_data and owner_data.get("id"):
                 return owner_data, _IDENTITY_OWNER
+        if thread_id and not _is_permission_failure(client):
+            plain_data = await client.send_post(chat_id, message or "")
+            if plain_data and plain_data.get("id"):
+                return plain_data, _IDENTITY_BOT
         return None, _IDENTITY_BOT
 
     try:
@@ -2150,6 +2475,7 @@ async def _standalone_send(
             "chat_id": chat_id,
             "message_id": str(data["id"]),
             "identity": identity,
+            "thread_id": str(data.get("threadId") or thread_id or ""),
         }
     except Exception as exc:  # noqa: BLE001
         return {"error": f"RingCentral standalone send failed: {exc}"}
@@ -2191,8 +2517,8 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="RC_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
-        allowed_users_env="RC_ALLOWED_USERS",
-        allow_all_env="RC_ALLOW_ALL_USERS",
+        allowed_users_env=_ALLOWED_USER_EMAILS_ENV,
+        allow_all_env=_ALLOW_ALL_USERS_ENV,
         max_message_length=MAX_POST_LENGTH,
         emoji="📞",
         allow_update_command=True,

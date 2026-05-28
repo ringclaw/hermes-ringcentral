@@ -39,9 +39,12 @@ export RC_USER_JWT_TOKEN="<owner JWT>"
 # messages and lets Hermes Agent produce the actual summary.
 export RC_SUMMARY_MESSAGE_LIMIT=250
 
-# Optional access control — comma-separated RC person IDs. If unset and
-# owner mode is configured, Hermes auto-seeds this to the owner person ID.
-export RC_ALLOWED_USERS="123456789,987654321"
+# Optional threaded replies. Values: first (default), all, off.
+export RC_REPLY_TO_MODE=first
+
+# Optional access control — comma/semicolon-separated RC user emails. If unset
+# and owner mode is configured, Hermes auto-seeds this to the owner email.
+export RC_ALLOWED_USER_EMAILS="john.lin@example.com,teammate@example.com"
 # Or for dev environments only:
 export RC_ALLOW_ALL_USERS=true
 
@@ -60,23 +63,31 @@ The plugin is auto-discovered from `plugins/platforms/ringcentral/`. The
 adapter connects the bot, fetches its own extension ID, opens a WebSocket
 subscription on `/team-messaging/v1/posts`, and starts relaying messages.
 When owner mode is configured, it also opens an owner WebSocket and resolves
-the owner person ID.
+the owner person ID and email.
 
 ## Behavior
 
-* **DMs** — authorized inbound posts are forwarded to the agent.
+* **DMs** — only direct chats that include the bot are forwarded to the
+  agent, and only when the sender is the owner email or is listed in
+  `RC_ALLOWED_USER_EMAILS`. Unauthorized DMs are ignored. Owner-visible DMs
+  with other people are ignored.
+* **Threaded replies** — by default, Hermes replies to the triggering
+  RingCentral post in a Team Messaging thread. Set `RC_REPLY_TO_MODE=off` to
+  keep replies as regular chat posts, or `all` to keep later reply chunks
+  threaded whenever Hermes supplies a reply anchor. RingCentral Direct chats
+  may accept the thread fields but still render replies as regular posts.
 * **Owner DM summaries** — the owner can DM the bot with
   `/summarize <group/person/chat id>` or `总结 <群名或人名>`. The plugin uses
   `RC_USER_*` to resolve and read recent messages from that owner-visible
   group or direct chat, then passes the formatted history to Hermes Agent.
   Natural-language target extraction falls back to Hermes plugin LLM access;
   the plugin does not generate summaries itself.
-* **Group / Team chats** — without owner mode, the bot responds when
-  explicitly addressed via `![:Person](<bot id>)`. With owner mode, only the
-  owner can trigger Hermes; group messages must mention the bot or start with
-  `/`. Non-owner group chatter is stored as observed context for later owner
-  requests, but never triggers the agent. Group summary commands are blocked
-  and should be sent from the owner DM instead.
+* **Group / Team chats** — the sender must be the owner email or listed in
+  `RC_ALLOWED_USER_EMAILS`, and the message must mention the bot or arrive in
+  a thread the bot already joined. With owner mode, unauthorized group chatter
+  is stored as observed context for later owner requests, but never triggers
+  the agent. Group summary commands are owner-only and should be sent from the
+  owner DM instead.
 * **Edits / deletes** — handled through `edit_message` / `delete_message`
   hooks the agent uses for streaming-style responses. If a message was sent
   via owner fallback, later edits/deletes use the owner identity too.
