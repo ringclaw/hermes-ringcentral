@@ -322,11 +322,17 @@ class RingCentralClient:
         text: str,
         *,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        parent_post_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Create a post in ``chat_id``. Returns the post dict on success."""
         payload: Dict[str, Any] = {"text": text or ""}
         if attachments:
             payload["attachments"] = attachments
+        if parent_post_id:
+            payload["parentPostId"] = str(parent_post_id)
+        elif thread_id:
+            payload["threadId"] = str(thread_id)
         return await self._request(
             "POST",
             f"/team-messaging/v1/chats/{quote(chat_id, safe='')}/posts",

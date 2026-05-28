@@ -23,9 +23,12 @@ from ringcentral import (  # noqa: E402
 from ringcentral.adapter import (  # noqa: E402
     RingCentralAdapter,
     check_requirements,
+    _allowed_user_emails,
     _content_type_for_filename,
+    _email_allowlist_from,
     _env_enablement,
     _is_connected,
+    _normalize_allowed_user_emails_env,
     _standalone_send,
     _summary_directory_search_terms,
     _summary_message_limit_from,
@@ -43,11 +46,11 @@ from ringcentral import adapter as _rc_mod  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(token: str = "test-token") -> Any:
+def _make_adapter(token: str = "test-token", extra: dict[str, Any] | None = None) -> Any:
     """Build a RingCentralAdapter without invoking network I/O."""
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, token=token, extra={})
+    cfg = PlatformConfig(enabled=True, token=token, extra=extra or {})
     return RingCentralAdapter(cfg)
 
 
@@ -121,6 +124,50 @@ class TestRingCentralClientOAuth:
 
         assert result == {"uri": "wss://example.test/ws", "ws_access_token": "ws-token"}
         assert calls == [("POST", "/restapi/oauth/wstoken", {})]
+
+    def test_send_post_includes_parent_post_id(self):
+        calls = []
+        client = RingCentralClient("access-token", server_url="https://platform.example.test")
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            return {"id": "p-reply", "threadId": "t-1"}
+
+        client._request = fake_request
+
+        result = asyncio.run(
+            client.send_post("g-1", "reply", parent_post_id="p-parent")
+        )
+
+        assert result == {"id": "p-reply", "threadId": "t-1"}
+        assert calls == [
+            (
+                "POST",
+                "/team-messaging/v1/chats/g-1/posts",
+                {"json_body": {"text": "reply", "parentPostId": "p-parent"}},
+            )
+        ]
+
+    def test_send_post_includes_thread_id(self):
+        calls = []
+        client = RingCentralClient("access-token", server_url="https://platform.example.test")
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            return {"id": "p-reply", "threadId": "t-1"}
+
+        client._request = fake_request
+
+        result = asyncio.run(client.send_post("g-1", "reply", thread_id="t-1"))
+
+        assert result == {"id": "p-reply", "threadId": "t-1"}
+        assert calls == [
+            (
+                "POST",
+                "/team-messaging/v1/chats/g-1/posts",
+                {"json_body": {"text": "reply", "threadId": "t-1"}},
+            )
+        ]
 
     def test_search_directory_posts_search_string(self):
         calls = []
@@ -231,6 +278,34 @@ class TestSummaryConfig:
     def test_summary_directory_terms_keep_chinese_request_for_llm_fallback(self):
         terms = _summary_directory_search_terms("我跟张三这一周的聊天")
         assert terms == ["我跟张三这一周的聊天"]
+
+
+class TestEmailAllowlistConfig:
+    def test_allowed_user_emails_parse_commas_semicolons_and_case(self):
+        assert _email_allowlist_from(
+            " Owner@Example.COM ; alice@example.com,bob@example.com "
+        ) == {
+            "owner@example.com",
+            "alice@example.com",
+            "bob@example.com",
+        }
+
+    def test_allowed_user_emails_ignore_person_ids(self):
+        assert _email_allowlist_from("owner-1,12345") == set()
+
+    def test_normalize_allowed_user_emails_env_ignores_legacy_var(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        monkeypatch.setenv("RC_ALLOWED_USERS", "owner-1")
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "Owner@Example.COM; alice@example.com")
+
+        _normalize_allowed_user_emails_env()
+
+        assert _allowed_user_emails() == {"owner@example.com", "alice@example.com"}
+        assert os.environ["RC_ALLOWED_USER_EMAILS"] == "alice@example.com,owner@example.com"
+        assert "RC_ALLOWED_USERS is ignored" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -524,12 +599,14 @@ class TestAdapterInit:
 
     def test_owner_allowlist_auto_seeded(self, monkeypatch):
         monkeypatch.delenv("RC_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("RC_ALLOWED_USER_EMAILS", raising=False)
         monkeypatch.delenv("RC_ALLOW_ALL_USERS", raising=False)
         adapter = _make_adapter()
         adapter._owner_person_id = "owner-1"
+        adapter._owner_email = "owner@example.com"
         adapter._seed_owner_allowlist()
         assert adapter._owner_only_gate_enabled is True
-        assert os.environ["RC_ALLOWED_USERS"] == "owner-1"
+        assert os.environ["RC_ALLOWED_USER_EMAILS"] == "owner@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +631,8 @@ class TestPluginRegistration:
         )
 
         assert adapter._intent_llm is ctx.llm
+        assert ctx.kwargs["allowed_users_env"] == "RC_ALLOWED_USER_EMAILS"
+        assert ctx.kwargs["allow_all_env"] == "RC_ALLOW_ALL_USERS"
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +690,115 @@ class TestAdapterSend:
         adapter._ws.mark_own_post.assert_called_once_with("p-owner")
         adapter._owner_ws.mark_own_post.assert_called_once_with("p-owner")
 
+    def test_send_uses_parent_post_id_for_reply_anchor(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-new-1", "threadId": "t-1"})
+        adapter._client = client
+        adapter._threads = MagicMock()
+
+        result = asyncio.run(adapter.send("g-1", "hello", reply_to="p-parent"))
+
+        assert result.success is True
+        assert result.message_id == "p-new-1"
+        client.send_post.assert_awaited_once_with(
+            "g-1",
+            "hello",
+            parent_post_id="p-parent",
+        )
+        adapter._threads.mark.assert_called_once_with("t-1")
+
+    def test_send_marks_parent_anchor_when_reply_response_has_no_thread_id(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-new-1"})
+        adapter._client = client
+        adapter._threads = MagicMock()
+
+        result = asyncio.run(adapter.send("g-1", "hello", reply_to="p-parent"))
+
+        assert result.success is True
+        adapter._threads.mark.assert_called_once_with("p-parent")
+
+    def test_send_uses_metadata_thread_id_for_existing_thread(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-new-1", "threadId": "t-1"})
+        adapter._client = client
+        adapter._threads = MagicMock()
+
+        result = asyncio.run(
+            adapter.send(
+                "g-1",
+                "hello",
+                reply_to="p-child",
+                metadata={"thread_id": "t-1"},
+            )
+        )
+
+        assert result.success is True
+        client.send_post.assert_awaited_once_with("g-1", "hello", thread_id="t-1")
+
+    def test_reply_to_mode_off_sends_unthreaded(self):
+        adapter = _make_adapter(extra={"reply_to_mode": "off"})
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-new-1"})
+        adapter._client = client
+
+        result = asyncio.run(adapter.send("g-1", "hello", reply_to="p-parent"))
+
+        assert result.success is True
+        client.send_post.assert_awaited_once_with("g-1", "hello")
+
+    def test_send_chunks_continue_in_returned_thread(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(
+            side_effect=[
+                {"id": "p-new-1", "threadId": "t-1"},
+                {"id": "p-new-2", "threadId": "t-1"},
+            ]
+        )
+        adapter._client = client
+        adapter._threads = MagicMock()
+        adapter.truncate_message = MagicMock(return_value=["part 1", "part 2"])
+
+        result = asyncio.run(adapter.send("g-1", "hello", reply_to="p-parent"))
+
+        assert result.success is True
+        assert result.message_id == "p-new-2"
+        assert client.send_post.await_args_list[0].args == ("g-1", "part 1")
+        assert client.send_post.await_args_list[0].kwargs == {
+            "parent_post_id": "p-parent"
+        }
+        assert client.send_post.await_args_list[1].args == ("g-1", "part 2")
+        assert client.send_post.await_args_list[1].kwargs == {"thread_id": "t-1"}
+
+    def test_owner_fallback_preserves_parent_post_id(self):
+        adapter = _make_adapter()
+        bot = MagicMock()
+        bot.last_status = 403
+        bot.send_post = AsyncMock(return_value=None)
+        owner = MagicMock()
+        owner.send_post = AsyncMock(return_value={"id": "p-owner", "threadId": "t-1"})
+        adapter._client = bot
+        adapter._owner_client = owner
+        adapter._threads = MagicMock()
+
+        result = asyncio.run(adapter.send("g-1", "hello", reply_to="p-parent"))
+
+        assert result.success is True
+        bot.send_post.assert_awaited_once_with(
+            "g-1",
+            "hello",
+            parent_post_id="p-parent",
+        )
+        owner.send_post.assert_awaited_once_with(
+            "g-1",
+            "hello",
+            parent_post_id="p-parent",
+        )
+
     def test_edit_uses_recorded_owner_identity(self):
         adapter = _make_adapter()
         bot = MagicMock()
@@ -643,16 +831,20 @@ class TestOwnerInboundHandling:
         ])
         client.get_person = AsyncMock(side_effect=lambda pid: {
             "firstName": "Owner" if pid == "owner-1" else "Alice",
+            "email": "owner@example.com" if pid == "owner-1" else "alice@example.com",
         })
         adapter._client = client
         adapter._owner_client = client
         adapter._own_person_id = "bot-1"
         adapter._owner_person_id = "owner-1"
+        adapter._owner_email = "owner@example.com"
         adapter._owner_only_gate_enabled = True
         adapter.handle_message = AsyncMock()
         return adapter
 
-    def test_non_owner_group_message_is_observed_not_dispatched(self):
+    def test_non_owner_group_message_is_observed_not_dispatched(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
+        monkeypatch.delenv("RC_ALLOW_ALL_USERS", raising=False)
         adapter = self._owner_adapter()
         store = MagicMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s-1")
@@ -673,7 +865,100 @@ class TestOwnerInboundHandling:
         assert "[Alice|user-2]" in appended["content"]
         assert "deployment is red" in appended["content"]
 
-    def test_non_owner_group_message_with_chat_id_is_observed(self):
+    def test_participated_thread_followup_dispatches_without_mention(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.list_chats = AsyncMock(return_value=[
+            {"id": "g-1", "type": "Team", "name": "Project"},
+        ])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter._threads = {"t-1"}
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-child",
+            "chatId": "g-1",
+            "creatorId": "user-2",
+            "text": "follow-up in thread",
+            "parentPostId": "p-parent",
+            "threadId": "t-1",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.thread_id == "t-1"
+        assert event.message_id == "p-child"
+        assert event.reply_to_message_id == "p-parent"
+
+    def test_participated_parent_anchor_dispatches_thread_followup(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.list_chats = AsyncMock(return_value=[
+            {"id": "g-1", "type": "Team", "name": "Project"},
+        ])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter._threads = {"p-parent"}
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-child",
+            "chatId": "g-1",
+            "creatorId": "user-2",
+            "text": "follow-up in thread",
+            "parentPostId": "p-parent",
+            "threadId": "t-1",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_awaited_once()
+
+    def test_untracked_thread_followup_is_ignored_without_mention(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.list_chats = AsyncMock(return_value=[
+            {"id": "g-1", "type": "Team", "name": "Project"},
+        ])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter._threads = set()
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-child",
+            "chatId": "g-1",
+            "creatorId": "user-2",
+            "text": "follow-up in unknown thread",
+            "parentPostId": "p-parent",
+            "threadId": "t-1",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_non_owner_group_message_with_chat_id_is_observed(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
+        monkeypatch.delenv("RC_ALLOW_ALL_USERS", raising=False)
         adapter = self._owner_adapter()
         store = MagicMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s-1")
@@ -693,7 +978,23 @@ class TestOwnerInboundHandling:
         assert appended["observed"] is True
         assert "deployment is still red" in appended["content"]
 
-    def test_owner_non_summary_slash_message_includes_observed_context(self):
+    def test_owner_non_summary_slash_message_in_group_is_ignored_without_mention(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
+        adapter = self._owner_adapter()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-2",
+            "groupId": "g-1",
+            "creatorId": "owner-1",
+            "text": "/status",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_owner_mentioned_group_message_includes_observed_context(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
         adapter = self._owner_adapter()
         store = MagicMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s-1")
@@ -710,7 +1011,7 @@ class TestOwnerInboundHandling:
             "id": "p-2",
             "groupId": "g-1",
             "creatorId": "owner-1",
-            "text": "/status",
+            "text": "![:Person](bot-1) /status",
         }
 
         asyncio.run(adapter._handle_ws_event(body, identity="owner"))
@@ -720,6 +1021,134 @@ class TestOwnerInboundHandling:
         assert "deployment is red" in event.text
         assert event.text.endswith("/status")
         assert "RingCentral group chat message from the owner" in event.channel_prompt
+
+    def test_owner_visible_non_bot_dm_from_owner_is_ignored(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.get_chat = AsyncMock(return_value={
+            "id": "dm-other",
+            "type": "Direct",
+            "members": [{"id": "owner-1"}, {"id": "user-2"}],
+        })
+        client.list_chats = AsyncMock(return_value=[])
+        adapter._client = client
+        adapter._owner_client = client
+        adapter._own_person_id = "bot-1"
+        adapter._owner_person_id = "owner-1"
+        adapter._owner_only_gate_enabled = True
+        adapter.handle_message = AsyncMock()
+        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-dm",
+            "chatId": "dm-other",
+            "creatorId": "owner-1",
+            "text": "hello alice",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._send_chunks.assert_not_awaited()
+
+    def test_owner_visible_bot_dm_from_owner_is_allowed(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.get_chat = AsyncMock(return_value={
+            "id": "dm-bot",
+            "type": "Direct",
+            "members": [{"id": "owner-1"}, {"id": "bot-1"}],
+        })
+        client.list_chats = AsyncMock(return_value=[])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Owner",
+            "email": "owner@example.com",
+        })
+        adapter._client = client
+        adapter._owner_client = client
+        adapter._own_person_id = "bot-1"
+        adapter._owner_person_id = "owner-1"
+        adapter._owner_email = "owner@example.com"
+        adapter._owner_only_gate_enabled = True
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-dm",
+            "chatId": "dm-bot",
+            "creatorId": "owner-1",
+            "text": "hello bot",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.user_id == "owner@example.com"
+        assert event.source.user_id_alt == "owner-1"
+
+    def test_bot_dm_from_allowed_email_is_dispatched(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.get_chat = AsyncMock(return_value={
+            "id": "dm-bot",
+            "type": "Direct",
+            "members": [{"id": "user-2"}, {"id": "bot-1"}],
+        })
+        client.list_chats = AsyncMock(return_value=[])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-dm",
+            "chatId": "dm-bot",
+            "creatorId": "user-2",
+            "text": "hello bot",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.user_id == "alice@example.com"
+        assert event.source.user_id_alt == "user-2"
+
+    def test_bot_dm_from_unauthorized_email_is_silent(self, monkeypatch):
+        monkeypatch.delenv("RC_ALLOWED_USER_EMAILS", raising=False)
+        monkeypatch.delenv("RC_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.get_chat = AsyncMock(return_value={
+            "id": "dm-bot",
+            "type": "Direct",
+            "members": [{"id": "user-2"}, {"id": "bot-1"}],
+        })
+        client.list_chats = AsyncMock(return_value=[])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter.handle_message = AsyncMock()
+        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-dm",
+            "chatId": "dm-bot",
+            "creatorId": "user-2",
+            "text": "hello bot",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._send_chunks.assert_not_awaited()
 
 
 class TestChatInfo:
@@ -746,18 +1175,29 @@ class TestOwnerDMSummary:
         adapter = _make_adapter()
         bot = MagicMock()
         bot.list_chats = AsyncMock(return_value=[
-            {"id": "dm-1", "type": "Direct", "name": "Owner DM"},
+            {
+                "id": "dm-1",
+                "type": "Direct",
+                "name": "Owner DM",
+                "members": [{"id": "owner-1"}, {"id": "bot-1"}],
+            },
             {"id": "g-1", "type": "Team", "name": "Project Team"},
         ])
         bot.get_person = AsyncMock(side_effect=lambda pid: {
             "firstName": "Owner" if pid == "owner-1" else "Alice",
+            "email": "owner@example.com" if pid == "owner-1" else "alice@example.com",
         })
         owner = MagicMock()
         owner.list_recent_chats = AsyncMock(return_value=[
             {"id": "g-1", "type": "Team", "name": "Project Team"},
         ])
         owner.list_chats = AsyncMock(return_value=[
-            {"id": "dm-1", "type": "Direct", "name": "Owner DM"},
+            {
+                "id": "dm-1",
+                "type": "Direct",
+                "name": "Owner DM",
+                "members": [{"id": "owner-1"}, {"id": "bot-1"}],
+            },
             {"id": "g-1", "type": "Team", "name": "Project Team"},
         ])
         owner.get_chat = AsyncMock(side_effect=lambda cid: {
@@ -787,6 +1227,7 @@ class TestOwnerDMSummary:
         adapter._owner_client = owner
         adapter._own_person_id = "bot-1"
         adapter._owner_person_id = "owner-1"
+        adapter._owner_email = "owner@example.com"
         adapter._owner_only_gate_enabled = True
         adapter._summary_message_limit = 250
         adapter.handle_message = AsyncMock()
@@ -807,6 +1248,8 @@ class TestOwnerDMSummary:
         owner.list_posts.assert_awaited_once_with("g-1", record_count=250)
         event = adapter.handle_message.await_args.args[0]
         assert event.message_type == _rc_mod.MessageType.TEXT
+        assert event.source.user_id == "owner@example.com"
+        assert event.source.user_id_alt == "owner-1"
         assert not event.text.startswith("/")
         assert "Summarize the RingCentral chat history" in event.text
         assert "First determine the requested time range" in event.text
@@ -1170,16 +1613,19 @@ class TestOwnerDMSummary:
 
         adapter.handle_message.assert_not_awaited()
         owner.list_posts.assert_not_awaited()
-        adapter._send_chunks.assert_awaited_once()
-        assert "Only the RingCentral owner" in adapter._send_chunks.await_args.args[1]
+        adapter._send_chunks.assert_not_awaited()
 
-    def test_missing_owner_credentials_returns_notice_not_agent_dispatch(self):
+    def test_missing_owner_credentials_returns_notice_not_agent_dispatch(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
         adapter = _make_adapter()
         bot = MagicMock()
         bot.list_chats = AsyncMock(return_value=[
             {"id": "dm-1", "type": "Direct", "name": "Owner DM"},
         ])
-        bot.get_person = AsyncMock(return_value={"firstName": "Owner"})
+        bot.get_person = AsyncMock(return_value={
+            "firstName": "Owner",
+            "email": "owner@example.com",
+        })
         adapter._client = bot
         adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
         adapter.handle_message = AsyncMock()
@@ -1271,4 +1717,23 @@ class TestStandaloneSend:
         assert result.get("success") is True
         assert result.get("message_id") == "p-x"
         fake_client.send_post.assert_awaited_once_with("g-1", "hi")
+        fake_client.close.assert_awaited_once()
+
+    def test_thread_id_is_used_for_text_post(self, monkeypatch):
+        monkeypatch.setenv("RC_BOT_TOKEN", "jwt")
+        from gateway.config import PlatformConfig
+
+        fake_client = MagicMock()
+        fake_client.send_post = AsyncMock(return_value={"id": "p-x", "threadId": "t-1"})
+        fake_client.close = AsyncMock()
+
+        cfg = PlatformConfig(token="jwt", extra={})
+        with patch.object(_rc_mod, "RingCentralClient", return_value=fake_client):
+            result = asyncio.run(
+                _standalone_send(cfg, "g-1", "hi", thread_id="t-1")
+            )
+
+        assert result.get("success") is True
+        assert result.get("thread_id") == "t-1"
+        fake_client.send_post.assert_awaited_once_with("g-1", "hi", thread_id="t-1")
         fake_client.close.assert_awaited_once()
