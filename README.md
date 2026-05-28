@@ -44,9 +44,20 @@ export RC_REPLY_TO_MODE=first
 
 # Optional access control — comma/semicolon-separated RC user emails. If unset
 # and owner mode is configured, Hermes auto-seeds this to the owner email.
-export RC_ALLOWED_USER_EMAILS="john.lin@example.com,teammate@example.com"
+export RC_ALLOWED_USER_EMAILS="owner@example.com,teammate@example.com"
 # Or for dev environments only:
 export RC_ALLOW_ALL_USERS=true
+
+# Optional group/team chat access control. These use RingCentral chat IDs.
+# If RC_ALLOWED_CHANNELS is set, the bot only responds in those group/team
+# chats. RC_IGNORED_CHANNELS takes precedence. Use "*" as a wildcard.
+export RC_ALLOWED_CHANNELS="g-abc123,g-def456"
+export RC_IGNORED_CHANNELS="g-muted"
+# Optional Discord-style trigger controls for group/team chats.
+export RC_REQUIRE_MENTION=true
+export RC_FREE_RESPONSE_CHANNELS="g-abc123"
+export RC_THREAD_REQUIRE_MENTION=false
+export RC_NO_THREAD_CHANNELS="g-announcements"
 
 # Optional — default chat/group ID for cron + notification delivery.
 export RC_HOME_CHANNEL="g-abc123"
@@ -75,7 +86,8 @@ the owner person ID and email.
   RingCentral post in a Team Messaging thread. Set `RC_REPLY_TO_MODE=off` to
   keep replies as regular chat posts, or `all` to keep later reply chunks
   threaded whenever Hermes supplies a reply anchor. RingCentral Direct chats
-  may accept the thread fields but still render replies as regular posts.
+  may accept the thread fields but still render replies as regular posts. Set
+  `RC_NO_THREAD_CHANNELS` to force regular posts in specific chats.
 * **Owner DM summaries** — the owner can DM the bot with
   `/summarize <group/person/chat id>` or `总结 <群名或人名>`. The plugin uses
   `RC_USER_*` to resolve and read recent messages from that owner-visible
@@ -83,11 +95,14 @@ the owner person ID and email.
   Natural-language target extraction falls back to Hermes plugin LLM access;
   the plugin does not generate summaries itself.
 * **Group / Team chats** — the sender must be the owner email or listed in
-  `RC_ALLOWED_USER_EMAILS`, and the message must mention the bot or arrive in
-  a thread the bot already joined. With owner mode, unauthorized group chatter
-  is stored as observed context for later owner requests, but never triggers
-  the agent. Group summary commands are owner-only and should be sent from the
-  owner DM instead.
+  `RC_ALLOWED_USER_EMAILS`, the chat must pass `RC_ALLOWED_CHANNELS` /
+  `RC_IGNORED_CHANNELS`, and the message must mention the bot or arrive in a
+  thread the bot already joined. Set `RC_REQUIRE_MENTION=false` or add chat IDs
+  to `RC_FREE_RESPONSE_CHANNELS` to allow authorized group messages without a
+  bot mention; set `RC_THREAD_REQUIRE_MENTION=true` to require mentions even in
+  joined threads. With owner mode, unauthorized group chatter is stored as
+  observed context for later owner requests, but never triggers the agent. Group
+  summary commands are owner-only and should be sent from the owner DM instead.
 * **Edits / deletes** — handled through `edit_message` / `delete_message`
   hooks the agent uses for streaming-style responses. If a message was sent
   via owner fallback, later edits/deletes use the owner identity too.

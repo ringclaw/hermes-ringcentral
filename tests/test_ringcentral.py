@@ -23,16 +23,23 @@ from ringcentral import (  # noqa: E402
 from ringcentral.adapter import (  # noqa: E402
     RingCentralAdapter,
     check_requirements,
+    _allowed_channels,
     _allowed_user_emails,
+    _channel_ids_from,
     _content_type_for_filename,
     _email_allowlist_from,
     _env_enablement,
+    _free_response_channels,
+    _ignored_channels,
     _is_connected,
+    _no_thread_channels,
     _normalize_allowed_user_emails_env,
+    _require_mention,
     _standalone_send,
     _summary_directory_search_terms,
     _summary_message_limit_from,
     _summary_query_from_text,
+    _thread_require_mention,
     _strip_rc_mentions,
     DEFAULT_SERVER_URL,
 )
@@ -336,6 +343,35 @@ class TestEmailAllowlistConfig:
 
     def test_allowed_user_emails_ignore_person_ids(self):
         assert _email_allowlist_from("owner-1,12345") == set()
+
+    def test_channel_ids_parse_commas_semicolons_and_wildcard(self):
+        assert _channel_ids_from(" g-1 ; g-2,* ") == {"g-1", "g-2", "*"}
+
+    def test_channel_env_helpers_parse_allowed_and_ignored(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-1; g-2")
+        monkeypatch.setenv("RC_IGNORED_CHANNELS", "g-muted,*")
+
+        assert _allowed_channels() == {"g-1", "g-2"}
+        assert _ignored_channels() == {"g-muted", "*"}
+
+    def test_trigger_channel_env_helpers_parse_free_and_no_thread(self, monkeypatch):
+        monkeypatch.setenv("RC_FREE_RESPONSE_CHANNELS", "g-free; *")
+        monkeypatch.setenv("RC_NO_THREAD_CHANNELS", "g-direct,g-plain")
+
+        assert _free_response_channels() == {"g-free", "*"}
+        assert _no_thread_channels() == {"g-direct", "g-plain"}
+
+    def test_trigger_bool_env_helpers_use_discord_defaults(self, monkeypatch):
+        monkeypatch.delenv("RC_REQUIRE_MENTION", raising=False)
+        monkeypatch.delenv("RC_THREAD_REQUIRE_MENTION", raising=False)
+
+        assert _require_mention() is True
+        assert _thread_require_mention() is False
+
+        monkeypatch.setenv("RC_REQUIRE_MENTION", "off")
+        monkeypatch.setenv("RC_THREAD_REQUIRE_MENTION", "yes")
+        assert _require_mention() is False
+        assert _thread_require_mention() is True
 
     def test_normalize_allowed_user_emails_env_ignores_legacy_var(
         self,
@@ -883,6 +919,36 @@ class TestAdapterSend:
         assert result.success is True
         client.send_post.assert_awaited_once_with("g-1", "hello")
 
+    def test_no_thread_channel_sends_unthreaded(self, monkeypatch):
+        monkeypatch.setenv("RC_NO_THREAD_CHANNELS", "g-1")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-new-1"})
+        adapter._client = client
+
+        result = asyncio.run(adapter.send("g-1", "hello", reply_to="p-parent"))
+
+        assert result.success is True
+        client.send_post.assert_awaited_once_with("g-1", "hello")
+
+    def test_no_thread_channel_wildcard_ignores_metadata_thread(self, monkeypatch):
+        monkeypatch.setenv("RC_NO_THREAD_CHANNELS", "*")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-new-1"})
+        adapter._client = client
+
+        result = asyncio.run(
+            adapter.send(
+                "g-1",
+                "hello",
+                metadata={"thread_id": "t-1"},
+            )
+        )
+
+        assert result.success is True
+        client.send_post.assert_awaited_once_with("g-1", "hello")
+
     def test_send_chunks_continue_in_returned_thread(self):
         adapter = _make_adapter()
         client = MagicMock()
@@ -975,6 +1041,43 @@ class TestOwnerInboundHandling:
         adapter.handle_message = AsyncMock()
         return adapter
 
+    @staticmethod
+    def _allowed_group_adapter():
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.list_chats = AsyncMock(return_value=[
+            {"id": "g-1", "type": "Team", "name": "Project"},
+            {"id": "g-2", "type": "Team", "name": "Other"},
+        ])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    @staticmethod
+    def _mentioned_group_body(chat_id: str = "g-1") -> dict:
+        return {
+            "eventType": "PostAdded",
+            "id": "p-allowed",
+            "chatId": chat_id,
+            "creatorId": "user-2",
+            "text": "![:Person](bot-1) hello",
+        }
+
+    @staticmethod
+    def _plain_group_body(chat_id: str = "g-1") -> dict:
+        return {
+            "eventType": "PostAdded",
+            "id": "p-plain",
+            "chatId": chat_id,
+            "creatorId": "user-2",
+            "text": "hello without mention",
+        }
+
     def test_non_owner_group_message_is_observed_not_dispatched(self, monkeypatch):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
         monkeypatch.delenv("RC_ALLOW_ALL_USERS", raising=False)
@@ -997,6 +1100,146 @@ class TestOwnerInboundHandling:
         assert appended["observed"] is True
         assert "[Alice|user-2]" in appended["content"]
         assert "deployment is red" in appended["content"]
+
+    def test_allowed_channel_permits_mentioned_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-1")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+
+    def test_non_allowed_channel_blocks_mentioned_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-2")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_ignored_channel_blocks_mentioned_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_IGNORED_CHANNELS", "g-1")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_ignored_channel_beats_allowed_channel(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-1")
+        monkeypatch.setenv("RC_IGNORED_CHANNELS", "g-1")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_allowed_channels_wildcard_permits_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "*")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+
+    def test_ignored_channels_wildcard_blocks_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_IGNORED_CHANNELS", "*")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_group_summary_notice_respects_channel_gate(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-2")
+        adapter = self._owner_adapter()
+        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-summary",
+            "groupId": "g-1",
+            "creatorId": "owner-1",
+            "text": "/summarize Project Team",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._send_chunks.assert_not_awaited()
+
+    def test_authorized_group_message_requires_mention_by_default(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._plain_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_require_mention_false_allows_plain_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_REQUIRE_MENTION", "false")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._plain_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+
+    def test_free_response_channel_allows_plain_group_message(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_FREE_RESPONSE_CHANNELS", "g-1")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._plain_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+
+    def test_non_free_response_channel_still_requires_mention(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_FREE_RESPONSE_CHANNELS", "g-2")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._plain_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_ignored_channel_beats_free_response_channel(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_FREE_RESPONSE_CHANNELS", "g-1")
+        monkeypatch.setenv("RC_IGNORED_CHANNELS", "g-1")
+        adapter = self._allowed_group_adapter()
+
+        asyncio.run(
+            adapter._handle_ws_event(self._plain_group_body(), identity="bot")
+        )
+
+        adapter.handle_message.assert_not_awaited()
 
     def test_participated_thread_followup_dispatches_without_mention(self, monkeypatch):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
@@ -1030,6 +1273,36 @@ class TestOwnerInboundHandling:
         assert event.source.thread_id == "t-1"
         assert event.message_id == "p-child"
         assert event.reply_to_message_id == "p-parent"
+
+    def test_thread_require_mention_blocks_unmentioned_followup(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_THREAD_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.list_chats = AsyncMock(return_value=[
+            {"id": "g-1", "type": "Team", "name": "Project"},
+        ])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter._threads = {"t-1"}
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-child",
+            "chatId": "g-1",
+            "creatorId": "user-2",
+            "text": "follow-up in thread",
+            "parentPostId": "p-parent",
+            "threadId": "t-1",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_not_awaited()
 
     def test_participated_thread_id_only_dispatches_without_mention(self, monkeypatch):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
@@ -1316,6 +1589,36 @@ class TestOwnerInboundHandling:
         assert event.source.user_id == "alice@example.com"
         assert event.source.user_id_alt == "user-2"
 
+    def test_bot_dm_ignores_group_channel_allowlist(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-allowed")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.get_chat = AsyncMock(return_value={
+            "id": "dm-bot",
+            "type": "Direct",
+            "members": [{"id": "user-2"}, {"id": "bot-1"}],
+        })
+        client.list_chats = AsyncMock(return_value=[])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-dm",
+            "chatId": "dm-bot",
+            "creatorId": "user-2",
+            "text": "hello bot",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_awaited_once()
+
     def test_bot_dm_from_unauthorized_email_is_silent(self, monkeypatch):
         monkeypatch.delenv("RC_ALLOWED_USER_EMAILS", raising=False)
         monkeypatch.delenv("RC_ALLOW_ALL_USERS", raising=False)
@@ -1463,6 +1766,22 @@ class TestOwnerDMSummary:
         metadata = event.raw_message["ringcentral_summary"]
         assert metadata["post_source"] == "team_messaging"
         assert metadata["usable_posts"] == 2
+
+    def test_owner_dm_summary_ignores_group_channel_allowlist(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-other")
+        adapter, owner = self._summary_adapter()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-trigger",
+            "groupId": "dm-1",
+            "creatorId": "owner-1",
+            "text": "/summarize Project Team 最近一天",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        owner.list_posts.assert_awaited_once_with("g-1", record_count=250)
+        adapter.handle_message.assert_awaited_once()
 
     def test_owner_dm_summary_accepts_chat_id_only_dm_event(self):
         adapter, owner = self._summary_adapter()
@@ -1962,4 +2281,24 @@ class TestStandaloneSend:
             "hi",
             parent_post_id="p-parent",
         )
+        fake_client.close.assert_awaited_once()
+
+    def test_no_thread_channel_sends_plain_text_post(self, monkeypatch):
+        monkeypatch.setenv("RC_BOT_TOKEN", "jwt")
+        monkeypatch.setenv("RC_NO_THREAD_CHANNELS", "g-1")
+        from gateway.config import PlatformConfig
+
+        fake_client = MagicMock()
+        fake_client.send_post = AsyncMock(return_value={"id": "p-x"})
+        fake_client.close = AsyncMock()
+
+        cfg = PlatformConfig(token="jwt", extra={})
+        with patch.object(_rc_mod, "RingCentralClient", return_value=fake_client):
+            result = asyncio.run(
+                _standalone_send(cfg, "g-1", "hi", thread_id="t-1")
+            )
+
+        assert result.get("success") is True
+        assert result.get("thread_id") == ""
+        fake_client.send_post.assert_awaited_once_with("g-1", "hi")
         fake_client.close.assert_awaited_once()

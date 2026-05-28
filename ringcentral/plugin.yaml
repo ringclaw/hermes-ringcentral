@@ -40,6 +40,30 @@ optional_env:
     description: "Allow any RingCentral user to trigger the bot (dev only)"
     prompt: "Allow all users? (true/false)"
     password: false
+  - name: RC_ALLOWED_CHANNELS
+    description: "Comma/semicolon-separated RingCentral chat IDs where the bot may respond. If set, group/team chats outside this list are ignored. Use * to allow all."
+    prompt: "Allowed chat IDs (comma-separated)"
+    password: false
+  - name: RC_IGNORED_CHANNELS
+    description: "Comma/semicolon-separated RingCentral chat IDs where the bot never responds. Takes precedence over RC_ALLOWED_CHANNELS. Use * to ignore all group/team chats."
+    prompt: "Ignored chat IDs (comma-separated)"
+    password: false
+  - name: RC_REQUIRE_MENTION
+    description: "Require a bot mention in RingCentral group/team chats before triggering Hermes (default: true)."
+    prompt: "Require mention in groups? (true/false)"
+    password: false
+  - name: RC_FREE_RESPONSE_CHANNELS
+    description: "Comma/semicolon-separated RingCentral chat IDs where authorized users can trigger Hermes without mentioning the bot. Use * for all group/team chats."
+    prompt: "Free-response chat IDs (comma-separated)"
+    password: false
+  - name: RC_THREAD_REQUIRE_MENTION
+    description: "Require a bot mention for follow-up messages in RingCentral threads the bot has already joined (default: false)."
+    prompt: "Require mention in threads? (true/false)"
+    password: false
+  - name: RC_NO_THREAD_CHANNELS
+    description: "Comma/semicolon-separated RingCentral chat IDs where replies should be regular posts instead of thread replies. Use * for all chats."
+    prompt: "No-thread chat IDs (comma-separated)"
+    password: false
   - name: RC_SUMMARY_MESSAGE_LIMIT
     description: "Recent messages to fetch with the owner token for DM-triggered chat summaries (default: 250, max: 1000)."
     prompt: "Summary message limit"
