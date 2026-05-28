@@ -55,6 +55,14 @@ TOKEN_REFRESH_SKEW_SECONDS = 60.0
 JWT_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
 
+def _json_id_value(value: Any) -> Any:
+    """Return numeric RingCentral IDs as JSON numbers when possible."""
+    raw = str(value or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return raw
+
+
 class RingCentralClient:
     """Async REST client for RingCentral Team Messaging v1.
 
@@ -330,9 +338,9 @@ class RingCentralClient:
         if attachments:
             payload["attachments"] = attachments
         if parent_post_id:
-            payload["parentPostId"] = str(parent_post_id)
+            payload["parentPostId"] = _json_id_value(parent_post_id)
         elif thread_id:
-            payload["threadId"] = str(thread_id)
+            payload["threadId"] = _json_id_value(thread_id)
         return await self._request(
             "POST",
             f"/team-messaging/v1/chats/{quote(chat_id, safe='')}/posts",
