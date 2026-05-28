@@ -35,9 +35,9 @@ export RC_SERVER_URL="https://platform.ringcentral.com"
 export RC_USER_CLIENT_ID="<owner app client id>"
 export RC_USER_CLIENT_SECRET="<owner app client secret>"
 export RC_USER_JWT_TOKEN="<owner JWT>"
-# Optional owner-summary window. The plugin fetches this many recent chat
-# messages and lets Hermes Agent produce the actual summary.
-export RC_SUMMARY_MESSAGE_LIMIT=250
+# Optional owner-history window. The plugin tool fetches this many recent
+# messages and lets Hermes Agent decide how to filter/summarize them.
+export RC_HISTORY_MESSAGE_LIMIT=250
 
 # Optional threaded replies. Values: first (default), all, off.
 export RC_REPLY_TO_MODE=first
@@ -88,12 +88,12 @@ the owner person ID and email.
   threaded whenever Hermes supplies a reply anchor. RingCentral Direct chats
   may accept the thread fields but still render replies as regular posts. Set
   `RC_NO_THREAD_CHANNELS` to force regular posts in specific chats.
-* **Owner DM summaries** — the owner can DM the bot with
-  `/summarize <group/person/chat id>` or `总结 <群名或人名>`. The plugin uses
-  `RC_USER_*` to resolve and read recent messages from that owner-visible
-  group or direct chat, then passes the formatted history to Hermes Agent.
-  Natural-language target extraction falls back to Hermes plugin LLM access;
-  the plugin does not generate summaries itself.
+* **Owner DM history** — when the owner asks the bot DM to summarize, search,
+  inspect, or answer questions about RingCentral chat history, Hermes Agent can
+  call the `ringcentral_get_recent_messages` tool. The tool uses `RC_USER_*` to
+  resolve and read recent messages from an owner-visible group, team, or direct
+  chat, then returns structured source messages. Hermes Agent handles intent,
+  target choice, time-window filtering, and the final answer.
 * **Group / Team chats** — the sender must be the owner email or listed in
   `RC_ALLOWED_USER_EMAILS`, the chat must pass `RC_ALLOWED_CHANNELS` /
   `RC_IGNORED_CHANNELS`, and the message must mention the bot or arrive in a
@@ -101,8 +101,7 @@ the owner person ID and email.
   to `RC_FREE_RESPONSE_CHANNELS` to allow authorized group messages without a
   bot mention; set `RC_THREAD_REQUIRE_MENTION=true` to require mentions even in
   joined threads. With owner mode, unauthorized group chatter is stored as
-  observed context for later owner requests, but never triggers the agent. Group
-  summary commands are owner-only and should be sent from the owner DM instead.
+  observed context for later owner requests, but never triggers the agent.
 * **Edits / deletes** — handled through `edit_message` / `delete_message`
   hooks the agent uses for streaming-style responses. If a message was sent
   via owner fallback, later edits/deletes use the owner identity too.
@@ -133,8 +132,8 @@ standalone-sender hook.
 | Gateway logs `RC_BOT_TOKEN not configured` | env var missing | `export RC_BOT_TOKEN=…` and restart |
 | Gateway logs `RingCentral rejected bot token` | bad / expired token | Re-issue the JWT from the dev portal |
 | Gateway logs owner auth failed | one of `RC_USER_*` is wrong or expired | Re-issue the owner JWT and verify client id/secret |
-| `/summarize <target>` says no owner credentials | `RC_USER_*` is incomplete | Set all three owner vars and restart |
-| `/summarize <target>` cannot find a chat/person | owner token cannot see the target, or the name is ambiguous | Use the exact group/person name, Person mention, or numeric ID |
+| Owner DM history request says no owner credentials | `RC_USER_*` is incomplete | Set all three owner vars and restart |
+| Owner DM history request cannot find a chat/person | owner token cannot see the target, or the name is ambiguous | Use the exact group/person name, Person mention, or numeric ID |
 | WS keeps disconnecting with `HTTP 401` | bot lacks `WebSocketsSubscription` scope | Add the scope, reinstall the bot |
 | Posts succeed but bot never replies in a group | bot wasn't addressed, or sender is not owner in owner mode | Owner should mention the bot or use a `/` command |
 | Files arrive but no media surfaces | attachment download blocked by SSRF rule | Verify the chat is accessible to the bot |

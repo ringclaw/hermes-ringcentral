@@ -30,15 +30,17 @@ from ringcentral.adapter import (  # noqa: E402
     _email_allowlist_from,
     _env_enablement,
     _free_response_channels,
+    _history_directory_search_terms,
+    _history_message_limit_from,
     _ignored_channels,
     _is_connected,
     _no_thread_channels,
     _normalize_allowed_user_emails_env,
     _require_mention,
+    _ringcentral_get_recent_messages,
+    _ringcentral_history_tool_available,
+    _RINGCENTRAL_HISTORY_TOOL_NAME,
     _standalone_send,
-    _summary_directory_search_terms,
-    _summary_message_limit_from,
-    _summary_query_from_text,
     _thread_require_mention,
     _strip_rc_mentions,
     DEFAULT_SERVER_URL,
@@ -298,36 +300,27 @@ class TestStripRCMentions:
 
 
 # ---------------------------------------------------------------------------
-# Summary parsing + config
+# History tool config
 # ---------------------------------------------------------------------------
 
 
-class TestSummaryConfig:
-    def test_summary_query_accepts_slash_command(self):
-        assert _summary_query_from_text("/summarize Project 最近一天") == "Project 最近一天"
+class TestHistoryConfig:
+    def test_history_limit_defaults(self, monkeypatch):
+        monkeypatch.delenv("RC_HISTORY_MESSAGE_LIMIT", raising=False)
+        assert _history_message_limit_from({}) == 250
 
-    def test_summary_query_accepts_chinese_keyword(self):
-        assert _summary_query_from_text("总结 Project") == "Project"
+    def test_history_limit_reads_and_clamps(self, monkeypatch):
+        monkeypatch.delenv("RC_HISTORY_MESSAGE_LIMIT", raising=False)
+        assert _history_message_limit_from({"history_message_limit": "5000"}) == 1000
+        assert _history_message_limit_from({"history_message_limit": "bad"}) == 250
 
-    def test_summary_query_rejects_normal_text(self):
-        assert _summary_query_from_text("please help with deployment") is None
-
-    def test_summary_limit_defaults(self, monkeypatch):
-        monkeypatch.delenv("RC_SUMMARY_MESSAGE_LIMIT", raising=False)
-        assert _summary_message_limit_from({}) == 250
-
-    def test_summary_limit_reads_and_clamps(self, monkeypatch):
-        monkeypatch.delenv("RC_SUMMARY_MESSAGE_LIMIT", raising=False)
-        assert _summary_message_limit_from({"summary_message_limit": "5000"}) == 1000
-        assert _summary_message_limit_from({"summary_message_limit": "bad"}) == 250
-
-    def test_summary_directory_terms_extract_name_candidate_without_stopwords(self):
-        terms = _summary_directory_search_terms("我跟 Justin Wu 这一周的聊天")
+    def test_history_directory_terms_extract_name_candidate_without_stopwords(self):
+        terms = _history_directory_search_terms("我跟 Justin Wu 这一周的聊天")
         assert terms[0] == "Justin Wu"
         assert "我跟 Justin Wu 这一周的聊天" in terms
 
-    def test_summary_directory_terms_keep_chinese_request_for_llm_fallback(self):
-        terms = _summary_directory_search_terms("我跟张三这一周的聊天")
+    def test_history_directory_terms_keep_non_latin_request(self):
+        terms = _history_directory_search_terms("我跟张三这一周的聊天")
         assert terms == ["我跟张三这一周的聊天"]
 
 
@@ -612,11 +605,11 @@ class TestEnvEnablement:
         assert seed["user_client_secret"] == "secret"
         assert seed["user_jwt_token"] == "user-jwt"
 
-    def test_summary_limit_seeded(self, monkeypatch):
+    def test_history_limit_seeded(self, monkeypatch):
         monkeypatch.setenv("RC_BOT_TOKEN", "jwt-abc")
-        monkeypatch.setenv("RC_SUMMARY_MESSAGE_LIMIT", "500")
+        monkeypatch.setenv("RC_HISTORY_MESSAGE_LIMIT", "500")
         seed = _env_enablement() or {}
-        assert seed["summary_message_limit"] == 500
+        assert seed["history_message_limit"] == 500
 
 
 # ---------------------------------------------------------------------------
@@ -657,21 +650,13 @@ class TestAdapterInit:
         adapter = RingCentralAdapter(cfg)
         assert adapter._server_url == "https://platform.devtest.ringcentral.com"
 
-    def test_summary_limit_from_config(self, monkeypatch):
-        monkeypatch.delenv("RC_SUMMARY_MESSAGE_LIMIT", raising=False)
+    def test_history_limit_from_config(self, monkeypatch):
+        monkeypatch.delenv("RC_HISTORY_MESSAGE_LIMIT", raising=False)
         from gateway.config import PlatformConfig
 
-        cfg = PlatformConfig(enabled=True, token="t", extra={"summary_message_limit": "333"})
+        cfg = PlatformConfig(enabled=True, token="t", extra={"history_message_limit": "333"})
         adapter = RingCentralAdapter(cfg)
-        assert adapter._summary_message_limit == 333
-
-    def test_accepts_intent_llm_from_plugin_context(self):
-        from gateway.config import PlatformConfig
-
-        llm = object()
-        cfg = PlatformConfig(enabled=True, token="t", extra={})
-        adapter = RingCentralAdapter(cfg, intent_llm=llm)
-        assert adapter._intent_llm is llm
+        assert adapter._history_message_limit == 333
 
     def test_name_is_ringcentral(self):
         adapter = _make_adapter()
@@ -695,24 +680,30 @@ class TestAdapterInit:
 
 
 class TestPluginRegistration:
-    def test_register_passes_context_llm_to_adapter_factory(self):
+    def test_register_registers_platform_and_history_tool(self):
         from gateway.config import PlatformConfig
 
         class Ctx:
-            llm = object()
-
             def register_platform(self, **kwargs):
-                self.kwargs = kwargs
+                self.platform_kwargs = kwargs
+
+            def register_tool(self, **kwargs):
+                self.tool_kwargs = kwargs
 
         ctx = Ctx()
         register(ctx)
-        adapter = ctx.kwargs["adapter_factory"](
+        adapter = ctx.platform_kwargs["adapter_factory"](
             PlatformConfig(enabled=True, token="t", extra={}),
         )
 
-        assert adapter._intent_llm is ctx.llm
-        assert ctx.kwargs["allowed_users_env"] == "RC_ALLOWED_USER_EMAILS"
-        assert ctx.kwargs["allow_all_env"] == "RC_ALLOW_ALL_USERS"
+        assert isinstance(adapter, RingCentralAdapter)
+        assert ctx.platform_kwargs["allowed_users_env"] == "RC_ALLOWED_USER_EMAILS"
+        assert ctx.platform_kwargs["allow_all_env"] == "RC_ALLOW_ALL_USERS"
+        assert ctx.tool_kwargs["name"] == _RINGCENTRAL_HISTORY_TOOL_NAME
+        assert ctx.tool_kwargs["toolset"] == "ringcentral"
+        assert ctx.tool_kwargs["handler"] is _ringcentral_get_recent_messages
+        assert ctx.tool_kwargs["check_fn"] is _ringcentral_history_tool_available
+        assert ctx.tool_kwargs["is_async"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1168,14 +1159,14 @@ class TestOwnerInboundHandling:
 
         adapter.handle_message.assert_not_awaited()
 
-    def test_group_summary_notice_respects_channel_gate(self, monkeypatch):
+    def test_group_slash_message_respects_channel_gate(self, monkeypatch):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
         monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-2")
         adapter = self._owner_adapter()
         adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
         body = {
             "eventType": "PostAdded",
-            "id": "p-summary",
+            "id": "p-slash",
             "groupId": "g-1",
             "creatorId": "owner-1",
             "text": "/summarize Project Team",
@@ -1449,7 +1440,7 @@ class TestOwnerInboundHandling:
         assert appended["observed"] is True
         assert "deployment is still red" in appended["content"]
 
-    def test_owner_non_summary_slash_message_in_group_is_ignored_without_mention(self, monkeypatch):
+    def test_owner_slash_message_in_group_is_ignored_without_mention(self, monkeypatch):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
         adapter = self._owner_adapter()
         body = {
@@ -1670,11 +1661,61 @@ class TestChatInfo:
         assert result["chat_id"] == "555555555555"
 
 
-class TestOwnerDMSummary:
+class TestRingCentralHistoryTool:
     @staticmethod
-    def _summary_adapter():
-        adapter = _make_adapter()
+    def _set_owner_env(monkeypatch):
+        monkeypatch.setenv("RC_BOT_TOKEN", "bot-token")
+        monkeypatch.setenv("RC_USER_CLIENT_ID", "owner-client")
+        monkeypatch.setenv("RC_USER_CLIENT_SECRET", "owner-secret")
+        monkeypatch.setenv("RC_USER_JWT_TOKEN", "owner-jwt")
+        monkeypatch.setenv("RC_HISTORY_MESSAGE_LIMIT", "250")
+
+    @staticmethod
+    def _profile(person_id: str) -> dict:
+        profiles = {
+            "owner-1": {
+                "firstName": "Owner",
+                "email": "owner@example.com",
+            },
+            "bot-1": {
+                "firstName": "Hermes",
+                "email": "bot@example.com",
+            },
+            "user-2": {
+                "firstName": "Alice",
+                "lastName": "Wang",
+                "email": "alice@example.com",
+            },
+        }
+        return profiles.get(str(person_id), {"firstName": "Unknown"})
+
+    @classmethod
+    def _clients(cls):
         bot = MagicMock()
+        bot.get_own_extension = AsyncMock(return_value={
+            "id": "bot-1",
+            "contact": {"firstName": "Hermes"},
+        })
+        bot.get_person = AsyncMock(side_effect=cls._profile)
+        bot.close = AsyncMock()
+
+        async def bot_get_chat(chat_id):
+            if chat_id == "dm-1":
+                return {
+                    "id": "dm-1",
+                    "type": "Direct",
+                    "name": "Owner DM",
+                    "members": [{"id": "owner-1"}, {"id": "bot-1"}],
+                }
+            if chat_id == "g-1":
+                return {
+                    "id": "g-1",
+                    "type": "Team",
+                    "name": "Project Team",
+                }
+            return None
+
+        bot.get_chat = AsyncMock(side_effect=bot_get_chat)
         bot.list_chats = AsyncMock(return_value=[
             {
                 "id": "dm-1",
@@ -1684,21 +1725,22 @@ class TestOwnerDMSummary:
             },
             {"id": "g-1", "type": "Team", "name": "Project Team"},
         ])
-        bot.get_person = AsyncMock(side_effect=lambda pid: {
-            "firstName": "Owner" if pid == "owner-1" else "Alice",
-            "email": "owner@example.com" if pid == "owner-1" else "alice@example.com",
-        })
+
         owner = MagicMock()
+        owner.owner_id = "owner-1"
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {
+                "firstName": "Owner",
+                "email": "owner@example.com",
+            },
+        })
+        owner.get_person = AsyncMock(side_effect=cls._profile)
+        owner.close = AsyncMock()
         owner.list_recent_chats = AsyncMock(return_value=[
             {"id": "g-1", "type": "Team", "name": "Project Team"},
         ])
         owner.list_chats = AsyncMock(return_value=[
-            {
-                "id": "dm-1",
-                "type": "Direct",
-                "name": "Owner DM",
-                "members": [{"id": "owner-1"}, {"id": "bot-1"}],
-            },
             {"id": "g-1", "type": "Team", "name": "Project Team"},
         ])
         owner.get_chat = AsyncMock(side_effect=lambda cid: {
@@ -1723,260 +1765,105 @@ class TestOwnerDMSummary:
         owner.list_legacy_group_posts = AsyncMock(return_value=[])
         owner.search_directory = AsyncMock(return_value=[])
         owner.create_or_find_dm = AsyncMock(return_value=None)
-        owner.get_person = bot.get_person
-        adapter._client = bot
-        adapter._owner_client = owner
-        adapter._own_person_id = "bot-1"
-        adapter._owner_person_id = "owner-1"
-        adapter._owner_email = "owner@example.com"
-        adapter._owner_only_gate_enabled = True
-        adapter._summary_message_limit = 250
-        adapter.handle_message = AsyncMock()
-        return adapter, owner
+        return bot, owner
 
-    def test_owner_dm_summary_fetches_group_posts_and_dispatches_to_agent(self):
-        adapter, owner = self._summary_adapter()
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team 最近一天",
+    @staticmethod
+    def _call_tool(
+        args: dict,
+        *,
+        platform: str = "ringcentral",
+        chat_id: str = "dm-1",
+        user_id: str = "owner@example.com",
+    ) -> dict:
+        from gateway.session_context import set_session_vars
+
+        tokens = set_session_vars(
+            platform=platform,
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name="Owner",
+        )
+        try:
+            return json.loads(asyncio.run(_ringcentral_get_recent_messages(args)))
+        finally:
+            for token in reversed(tokens):
+                token.var.reset(token)
+
+    def _call_tool_with_clients(self, monkeypatch, bot, owner, args, **session):
+        self._set_owner_env(monkeypatch)
+        with patch.object(_rc_mod, "RingCentralClient", return_value=bot) as client_cls:
+            client_cls.from_jwt.return_value = owner
+            return self._call_tool(args, **session)
+
+    def test_history_tool_availability_requires_bot_and_owner_env(self, monkeypatch):
+        monkeypatch.delenv("RC_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
+
+        assert _ringcentral_history_tool_available() is False
+
+        self._set_owner_env(monkeypatch)
+        assert _ringcentral_history_tool_available() is True
+
+    def test_owner_dm_tool_fetches_group_history(self, monkeypatch):
+        bot, owner = self._clients()
+
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "Project Team"},
+        )
+
+        assert result["success"] is True
+        assert result["target_chat"] == {
+            "id": "g-1",
+            "name": "Project Team",
+            "type": "group",
+            "person_id": "",
         }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
+        assert result["post_source"] == "team_messaging"
+        assert result["included_count"] == 2
+        assert [msg["id"] for msg in result["messages"]] == ["p-old", "p-new"]
+        assert result["messages"][0]["sender"] == "Owner (owner-1)"
+        assert result["messages"][1]["sender"] == "Alice (user-2)"
         owner.list_posts.assert_awaited_once_with("g-1", record_count=250)
-        event = adapter.handle_message.await_args.args[0]
-        assert event.message_type == _rc_mod.MessageType.TEXT
-        assert event.source.user_id == "owner@example.com"
-        assert event.source.user_id_alt == "owner-1"
-        assert not event.text.startswith("/")
-        assert "Summarize the RingCentral chat history" in event.text
-        assert "First determine the requested time range" in event.text
-        assert "Project Team" in event.channel_context
-        assert "Current gateway time:" in event.channel_context
-        assert "Message timestamps are shown as local gateway time followed by UTC" in event.channel_context
-        assert "/ 2026-05-28 02:10 UTC" in event.channel_context
-        assert "Owner (owner-1): please deploy" in event.channel_context
-        assert "Alice (user-2): deployment finished" in event.channel_context
-        assert "owner's RC_USER credentials" in event.channel_prompt
-        assert "filter the provided messages by their timestamps" in event.channel_prompt
         owner.list_legacy_group_posts.assert_not_awaited()
-        metadata = event.raw_message["ringcentral_summary"]
-        assert metadata["post_source"] == "team_messaging"
-        assert metadata["usable_posts"] == 2
+        bot.close.assert_awaited_once()
+        owner.close.assert_awaited_once()
 
-    def test_owner_dm_summary_ignores_group_channel_allowlist(self, monkeypatch):
-        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-other")
-        adapter, owner = self._summary_adapter()
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team 最近一天",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        owner.list_posts.assert_awaited_once_with("g-1", record_count=250)
-        adapter.handle_message.assert_awaited_once()
-
-    def test_owner_dm_summary_accepts_chat_id_only_dm_event(self):
-        adapter, owner = self._summary_adapter()
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "chatId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team 最近一天",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
-
-        owner.list_posts.assert_awaited_once_with("g-1", record_count=250)
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.await_args.args[0]
-        assert event.source.chat_id == "dm-1"
-        assert "Project Team" in event.channel_context
-
-    def test_owner_dm_summary_resolves_person_mention_to_direct_chat(self):
-        adapter, owner = self._summary_adapter()
-        owner.create_or_find_dm = AsyncMock(return_value={
-            "id": "dm-user-1",
-            "type": "Direct",
-        })
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize ![:Person](20001) 今天",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        owner.create_or_find_dm.assert_awaited_once_with(["20001"])
-        owner.list_posts.assert_awaited_once_with("dm-user-1", record_count=250)
-        owner.list_legacy_group_posts.assert_not_awaited()
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.await_args.args[0]
-        assert "Summarize the RingCentral chat history" in event.text
-        assert "Target chat: Alice (id: dm-user-1)" in event.channel_context
-        metadata = event.raw_message["ringcentral_summary"]
-        assert metadata["target_chat"]["type"] == "dm"
-        assert metadata["post_source"] == "team_messaging"
-
-    def test_owner_dm_summary_resolves_directory_name_to_direct_chat(self):
-        adapter, owner = self._summary_adapter()
-        owner.search_directory = AsyncMock(return_value=[
-            {
-                "id": "20002",
-                "firstName": "Alice",
-                "lastName": "Wang",
-                "email": "alice@example.com",
-            },
-        ])
+    def test_owner_dm_tool_resolves_directory_person_to_direct_history(self, monkeypatch):
+        bot, owner = self._clients()
+        owner.search_directory = AsyncMock(return_value=[{
+            "id": "user-2",
+            "firstName": "Alice",
+            "lastName": "Wang",
+            "email": "alice@example.com",
+        }])
         owner.create_or_find_dm = AsyncMock(return_value={
             "id": "dm-alice",
             "type": "Direct",
         })
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Alice Wang 昨天",
-        }
 
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "Alice Wang", "target_type": "person", "record_count": 10},
+        )
 
+        assert result["success"] is True
+        assert result["target_chat"]["id"] == "dm-alice"
+        assert result["target_chat"]["type"] == "dm"
+        assert result["post_source"] == "team_messaging"
         owner.search_directory.assert_awaited()
-        assert owner.search_directory.await_args_list[0].args == ("Alice Wang",)
-        owner.create_or_find_dm.assert_awaited_once_with(["20002"])
-        owner.list_posts.assert_awaited_once_with("dm-alice", record_count=250)
-        event = adapter.handle_message.await_args.args[0]
-        assert "Target chat: Alice Wang (id: dm-alice)" in event.channel_context
+        owner.create_or_find_dm.assert_awaited_once_with(["user-2"])
+        owner.list_posts.assert_awaited_once_with("dm-alice", record_count=10)
+        owner.list_legacy_group_posts.assert_not_awaited()
 
-    def test_owner_dm_summary_uses_llm_target_extraction_for_chinese_person(self):
-        adapter, owner = self._summary_adapter()
-        llm_result = MagicMock(parsed={
-            "target_text": "张三",
-            "target_kind": "person",
-            "confidence": 0.92,
-            "reason": "explicit person name",
-        })
-        adapter._intent_llm = MagicMock()
-        adapter._intent_llm.acomplete_structured = AsyncMock(return_value=llm_result)
-
-        async def search_directory(term):
-            if term == "张三":
-                return [{
-                    "id": "20004",
-                    "firstName": "张",
-                    "lastName": "三",
-                    "email": "zhangsan@example.com",
-                }]
-            return []
-
-        owner.search_directory = AsyncMock(side_effect=search_directory)
-        owner.create_or_find_dm = AsyncMock(return_value={
-            "id": "dm-zhangsan",
-            "type": "Direct",
-        })
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "总结 我跟张三这一周的聊天",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        adapter._intent_llm.acomplete_structured.assert_awaited_once()
-        assert owner.search_directory.await_args_list[0].args == ("我跟张三这一周的聊天",)
-        assert owner.search_directory.await_args_list[-1].args == ("张三",)
-        owner.create_or_find_dm.assert_awaited_once_with(["20004"])
-        owner.list_posts.assert_awaited_once_with("dm-zhangsan", record_count=250)
-        event = adapter.handle_message.await_args.args[0]
-        assert "Target chat: 张 三 (id: dm-zhangsan)" in event.channel_context
-
-    def test_summary_target_llm_not_called_for_explicit_person_mention(self):
-        adapter, owner = self._summary_adapter()
-        adapter._intent_llm = MagicMock()
-        adapter._intent_llm.acomplete_structured = AsyncMock()
-        owner.create_or_find_dm = AsyncMock(return_value={
-            "id": "dm-user-1",
-            "type": "Direct",
-        })
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize ![:Person](20001) 今天",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        adapter._intent_llm.acomplete_structured.assert_not_awaited()
-        owner.create_or_find_dm.assert_awaited_once_with(["20001"])
-        owner.list_posts.assert_awaited_once_with("dm-user-1", record_count=250)
-
-    def test_summary_target_llm_low_confidence_fails_closed(self):
-        adapter, owner = self._summary_adapter()
-        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
-        adapter._intent_llm = MagicMock()
-        adapter._intent_llm.acomplete_structured = AsyncMock(return_value=MagicMock(
-            parsed={
-                "target_text": "张三",
-                "target_kind": "person",
-                "confidence": 0.2,
-            },
-        ))
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "总结 我跟张三这一周的聊天",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        adapter._intent_llm.acomplete_structured.assert_awaited_once()
-        owner.list_posts.assert_not_awaited()
-        adapter.handle_message.assert_not_awaited()
-        adapter._send_chunks.assert_awaited_once()
-        assert "Could not find" in adapter._send_chunks.await_args.args[1]
-
-    def test_owner_dm_summary_resolves_numeric_user_id_to_direct_chat(self):
-        adapter, owner = self._summary_adapter()
-        owner.create_or_find_dm = AsyncMock(return_value={
-            "id": "dm-user-3",
-            "type": "Direct",
-        })
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize 20003",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        owner.get_chat.assert_any_await("20003")
-        owner.search_directory.assert_not_awaited()
-        owner.create_or_find_dm.assert_awaited_once_with(["20003"])
-        owner.list_posts.assert_awaited_once_with("dm-user-3", record_count=250)
-        event = adapter.handle_message.await_args.args[0]
-        assert event.raw_message["ringcentral_summary"]["target_chat"]["type"] == "dm"
-
-    def test_owner_dm_summary_uses_legacy_text_for_integration_posts(self):
-        adapter, owner = self._summary_adapter()
+    def test_owner_dm_tool_uses_legacy_text_for_integration_posts(self, monkeypatch):
+        bot, owner = self._clients()
         owner.list_posts = AsyncMock(return_value=[
             {
                 "id": "p-webhook",
@@ -2004,178 +1891,140 @@ class TestOwnerDMSummary:
                 "creationTime": "2026-05-28T02:20:00Z",
             },
         ])
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team 最近一天",
-        }
 
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "Project Team"},
+        )
 
+        assert result["success"] is True
+        assert result["post_source"] == "team_messaging+legacy_glip_groups"
+        assert result["fallback_attempted"] is True
+        assert result["included_count"] == 2
+        assert result["messages"][0]["text"] == "manual update"
+        assert result["messages"][1]["sender"] == "NewsBot (integration)"
+        assert result["messages"][1]["source"] == "legacy_glip_groups"
         owner.list_legacy_group_posts.assert_awaited_once_with(
             "g-1",
             record_count=250,
         )
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.await_args.args[0]
-        assert "NewsBot (integration): integration update" in event.channel_context
-        assert "Alice (user-2): manual update" in event.channel_context
-        metadata = event.raw_message["ringcentral_summary"]
-        assert metadata["post_source"] == "team_messaging+legacy_glip_groups"
-        assert metadata["fallback_attempted"] is True
-        assert metadata["usable_posts"] == 2
 
-    def test_owner_dm_summary_skips_system_events_without_fallback(self):
-        adapter, owner = self._summary_adapter()
-        owner.list_posts = AsyncMock(return_value=[
-            {
-                "id": "p-system",
-                "type": "PersonsAdded",
-                "creatorId": "owner-1",
-                "mentions": [{"id": "user-2"}],
-                "creationTime": "2026-05-28T02:20:00Z",
-            },
-            {
-                "id": "p-user",
-                "type": "TextMessage",
-                "creatorId": "user-2",
-                "text": "manual update",
-                "creationTime": "2026-05-28T02:10:00Z",
-            },
-        ])
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team",
-        }
+    def test_tool_rejects_non_owner_session_user(self, monkeypatch):
+        bot, owner = self._clients()
 
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "Project Team"},
+            user_id="alice@example.com",
+        )
 
-        owner.list_legacy_group_posts.assert_not_awaited()
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.await_args.args[0]
-        assert "manual update" in event.channel_context
-        assert "p-system" not in event.channel_context
-        assert "PersonsAdded" not in event.channel_context
-
-    def test_owner_dm_summary_notices_when_fallback_has_no_readable_text(self):
-        adapter, owner = self._summary_adapter()
-        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
-        owner.list_posts = AsyncMock(return_value=[
-            {
-                "id": "p-webhook",
-                "type": "TextMessage",
-                "creatorId": "",
-                "text": "",
-                "creationTime": "2026-05-28T02:20:00Z",
-            },
-        ])
-        owner.list_legacy_group_posts = AsyncMock(return_value=[
-            {
-                "id": "p-webhook",
-                "groupId": "g-1",
-                "type": "TextMessage",
-                "creatorId": "",
-                "text": "",
-                "creationTime": "2026-05-28T02:20:00Z",
-            },
-        ])
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        owner.list_legacy_group_posts.assert_awaited_once()
-        adapter.handle_message.assert_not_awaited()
-        adapter._send_chunks.assert_awaited_once()
-        assert "no readable message text" in adapter._send_chunks.await_args.args[1]
-
-    def test_owner_dm_summary_uses_explicit_chat_id(self):
-        adapter, owner = self._summary_adapter()
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "dm-1",
-            "creatorId": "owner-1",
-            "text": "/summarize 555555555555",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        owner.get_chat.assert_awaited()
-        owner.list_posts.assert_awaited_once_with("555555555555", record_count=250)
-        adapter.handle_message.assert_awaited_once()
-
-    def test_non_owner_chat_id_summary_in_dm_is_rejected(self):
-        adapter, owner = self._summary_adapter()
-        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "chatId": "dm-1",
-            "creatorId": "user-2",
-            "text": "/summarize Project Team",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
-
-        adapter.handle_message.assert_not_awaited()
+        assert result["success"] is False
+        assert "Only the configured RingCentral owner" in result["error"]
         owner.list_posts.assert_not_awaited()
-        adapter._send_chunks.assert_not_awaited()
 
-    def test_missing_owner_credentials_returns_notice_not_agent_dispatch(self, monkeypatch):
+    def test_tool_rejects_group_session(self, monkeypatch):
+        bot, owner = self._clients()
+
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "Project Team"},
+            chat_id="g-1",
+        )
+
+        assert result["success"] is False
+        assert "bot DM" in result["error"]
+        owner.list_posts.assert_not_awaited()
+
+    def test_tool_rejects_dm_without_owner_bot_members(self, monkeypatch):
+        bot, owner = self._clients()
+        bot.get_chat = AsyncMock(return_value={
+            "id": "dm-other",
+            "type": "Direct",
+            "members": [{"id": "owner-1"}, {"id": "user-2"}],
+        })
+
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "Project Team"},
+            chat_id="dm-other",
+        )
+
+        assert result["success"] is False
+        assert "owner-bot DM" in result["error"]
+        owner.list_posts.assert_not_awaited()
+
+    def test_tool_rejects_missing_owner_credentials(self, monkeypatch):
+        monkeypatch.setenv("RC_BOT_TOKEN", "bot-token")
+        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
+
+        result = self._call_tool({"target": "Project Team"})
+
+        assert result["success"] is False
+        assert "RC_USER_CLIENT_ID" in result["error"]
+
+    def test_tool_rejects_non_ringcentral_session(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+
+        result = self._call_tool(
+            {"target": "Project Team"},
+            platform="discord",
+        )
+
+        assert result["success"] is False
+        assert "RingCentral session" in result["error"]
+
+    def test_owner_dm_message_is_forwarded_to_agent_with_history_tool_prompt(
+        self,
+        monkeypatch,
+    ):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
         adapter = _make_adapter()
         bot = MagicMock()
-        bot.list_chats = AsyncMock(return_value=[
-            {"id": "dm-1", "type": "Direct", "name": "Owner DM"},
-        ])
+        bot.get_chat = AsyncMock(return_value={
+            "id": "dm-1",
+            "type": "Direct",
+            "members": [{"id": "owner-1"}, {"id": "bot-1"}],
+        })
+        bot.list_chats = AsyncMock(return_value=[])
         bot.get_person = AsyncMock(return_value={
             "firstName": "Owner",
             "email": "owner@example.com",
         })
+        owner = MagicMock()
+        owner.list_posts = AsyncMock()
         adapter._client = bot
-        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
+        adapter._owner_client = owner
+        adapter._own_person_id = "bot-1"
+        adapter._owner_person_id = "owner-1"
+        adapter._owner_email = "owner@example.com"
+        adapter._owner_only_gate_enabled = True
         adapter.handle_message = AsyncMock()
         body = {
             "eventType": "PostAdded",
             "id": "p-trigger",
-            "groupId": "dm-1",
+            "chatId": "dm-1",
             "creatorId": "owner-1",
-            "text": "/summarize Project Team",
+            "text": "总结 Project Team 最近一天",
         }
 
         asyncio.run(adapter._handle_ws_event(body, identity="bot"))
 
-        adapter.handle_message.assert_not_awaited()
-        adapter._send_chunks.assert_awaited_once()
-        assert "RC_USER_CLIENT_ID" in adapter._send_chunks.await_args.args[1]
-
-    def test_group_summary_request_is_blocked_with_dm_hint(self):
-        adapter = TestOwnerInboundHandling._owner_adapter()
-        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
-        body = {
-            "eventType": "PostAdded",
-            "id": "p-trigger",
-            "groupId": "g-1",
-            "creatorId": "owner-1",
-            "text": "/summarize Project Team",
-        }
-
-        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
-
-        adapter.handle_message.assert_not_awaited()
-        adapter._send_chunks.assert_awaited_once()
-        assert "bot DM" in adapter._send_chunks.await_args.args[1]
+        owner.list_posts.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == _rc_mod.MessageType.TEXT
+        assert event.text == "总结 Project Team 最近一天"
+        assert _RINGCENTRAL_HISTORY_TOOL_NAME in event.channel_prompt
 
 
 # ---------------------------------------------------------------------------

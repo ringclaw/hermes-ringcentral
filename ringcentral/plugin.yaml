@@ -1,6 +1,8 @@
 name: ringcentral-platform
 label: RingCentral
 kind: platform
+provides_tools:
+  - ringcentral_get_recent_messages
 version: 1.0.0
 description: >
   RingCentral Team Messaging gateway adapter for Hermes Agent.
@@ -64,9 +66,9 @@ optional_env:
     description: "Comma/semicolon-separated RingCentral chat IDs where replies should be regular posts instead of thread replies. Use * for all chats."
     prompt: "No-thread chat IDs (comma-separated)"
     password: false
-  - name: RC_SUMMARY_MESSAGE_LIMIT
-    description: "Recent messages to fetch with the owner token for DM-triggered chat summaries (default: 250, max: 1000)."
-    prompt: "Summary message limit"
+  - name: RC_HISTORY_MESSAGE_LIMIT
+    description: "Recent messages to fetch with the owner token for Hermes history-tool reads (default: 250, max: 1000)."
+    prompt: "History message limit"
     password: false
   - name: RC_REPLY_TO_MODE
     description: "Threaded reply mode for RingCentral posts: first (default), all, or off."
