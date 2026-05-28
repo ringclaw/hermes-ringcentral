@@ -1,149 +1,179 @@
-# RingCentral Team Messaging Plugin
+# Hermes RingCentral Plugin
 
-A Hermes Agent gateway adapter that connects RingCentral Team Messaging
-(the chat surface in RingCentral / RingEX) to Hermes. The bot identity is
-the primary conversation identity. An optional owner identity can observe
-owner-visible groups and send when the bot is not a member.
+RingCentral Team Messaging support for Hermes Agent. This plugin lets a Hermes
+agent talk through a RingCentral bot, reply in threads, read owner-visible chat
+history when explicitly requested by the owner, and deliver scheduled
+notifications into RingCentral.
 
-## Setup
+[中文说明](README.zh-CN.md)
 
-### 1. Create a bot in the RingCentral developer portal
+## Quick Start
 
-1. Sign in at <https://developers.ringcentral.com/> with a RingCentral account
-   that has Super Admin rights on the target company / sandbox.
-2. **Create App** → choose **Bot** (server-only, JWT) as the platform type.
-3. Grant the bot the following permissions (minimum):
-   - `TeamMessaging` — read + write chats and posts
-   - `ReadAccounts` — required to resolve the bot's own extension ID
-   - `WebSocketsSubscription` — required to open the WebSocket subscription
-4. After publishing the bot to your account, copy the **bot JWT token** from
-   the app credentials page. This is the value used as `RC_BOT_TOKEN`.
+Install with the Hermes plugin manager:
 
-### 2. Configure Hermes
+```sh
+hermes plugins install ringclaw/hermes-ringcentral --enable
+```
 
-Set the bot token (and optional knobs) via env vars or `hermes config`:
+The installer prompts for `RC_BOT_TOKEN` and saves it to `~/.hermes/.env`. If
+the plugin is already installed but disabled, enable it with:
+
+```sh
+hermes plugins enable ringcentral-platform
+```
+
+Restart the gateway after installing or changing credentials:
+
+```sh
+hermes gateway restart
+```
+
+For first-time gateway setup, `hermes gateway start` is also fine.
+
+## RingCentral App Setup
+
+Create a RingCentral bot app in the RingCentral developer portal:
+
+1. Sign in at <https://developers.ringcentral.com/>.
+2. Create an app with the **Bot** platform type.
+3. Grant at least these permissions:
+   - `TeamMessaging` for reading and writing team messages
+   - `ReadAccounts` for resolving the bot extension
+   - `WebSocketsSubscription` for live message events
+4. Install or publish the bot to the target RingCentral account.
+5. Copy the bot JWT and use it as `RC_BOT_TOKEN`.
+
+For owner-only history summaries or fallback sends, also configure a user JWT
+app for the owner account and set all three `RC_USER_*` variables.
+
+## Configuration
+
+Minimum:
 
 ```sh
 export RC_BOT_TOKEN="<bot JWT>"
-# Optional — defaults to production. Use the devtest URL for sandbox accounts:
-#   https://platform.devtest.ringcentral.com
+```
+
+Common optional settings:
+
+```sh
+# Production is the default. Use devtest for sandbox accounts.
 export RC_SERVER_URL="https://platform.ringcentral.com"
 
-# Optional owner mode. These three vars are only used together.
-# Owner mode lets Hermes observe owner-visible groups and fallback-send as
-# the owner when the bot is not in a target group.
+# Owner mode: enables owner-only history reads and fallback sends.
 export RC_USER_CLIENT_ID="<owner app client id>"
 export RC_USER_CLIENT_SECRET="<owner app client secret>"
 export RC_USER_JWT_TOKEN="<owner JWT>"
-# Optional owner-history window. The plugin tool fetches this many recent
-# messages and lets Hermes Agent decide how to filter/summarize them.
 export RC_HISTORY_MESSAGE_LIMIT=250
 
-# Optional threaded replies. Values: first (default), all, off.
-export RC_REPLY_TO_MODE=first
-
-# Optional access control — comma/semicolon-separated RC user emails. If unset
-# and owner mode is configured, Hermes auto-seeds this to the owner email.
+# User access control. If owner mode is configured and this is unset,
+# the plugin auto-seeds the owner email as the only allowed user.
 export RC_ALLOWED_USER_EMAILS="owner@example.com,teammate@example.com"
-# Or for dev environments only:
-export RC_ALLOW_ALL_USERS=true
+export RC_ALLOW_ALL_USERS=false
 
-# Optional group/team chat access control. These use RingCentral chat IDs.
-# If RC_ALLOWED_CHANNELS is set, the bot only responds in those group/team
-# chats. RC_IGNORED_CHANNELS takes precedence. Use "*" as a wildcard.
+# Group/team channel controls.
 export RC_ALLOWED_CHANNELS="g-abc123,g-def456"
 export RC_IGNORED_CHANNELS="g-muted"
-# Optional Discord-style trigger controls for group/team chats.
 export RC_REQUIRE_MENTION=true
 export RC_FREE_RESPONSE_CHANNELS="g-abc123"
 export RC_THREAD_REQUIRE_MENTION=false
+
+# Threading and delivery.
+export RC_REPLY_TO_MODE=first
 export RC_NO_THREAD_CHANNELS="g-announcements"
-
-# Optional — default chat/group ID for cron + notification delivery.
 export RC_HOME_CHANNEL="g-abc123"
-export RC_HOME_CHANNEL_NAME="Hermes-Updates"
+export RC_HOME_CHANNEL_NAME="Hermes Updates"
 ```
 
-### 3. Start the gateway
+Put persistent values in `~/.hermes/.env` if you do not want to export them in
+your shell each time.
 
-```sh
-hermes gateway start
+## How To Use
+
+### Direct messages
+
+DM the RingCentral bot and talk to Hermes normally:
+
+```text
+Can you draft a deployment update for the team?
 ```
 
-The plugin is auto-discovered from `plugins/platforms/ringcentral/`. The
-adapter connects the bot, fetches its own extension ID, opens a WebSocket
-subscription on `/team-messaging/v1/posts`, and starts relaying messages.
-When owner mode is configured, it also opens an owner WebSocket and resolves
-the owner person ID and email.
+Only the configured owner or users in `RC_ALLOWED_USER_EMAILS` can trigger the
+bot. Unauthorized DMs are ignored.
 
-## Behavior
+### Group and team chats
 
-* **DMs** — only direct chats that include the bot are forwarded to the
-  agent, and only when the sender is the owner email or is listed in
-  `RC_ALLOWED_USER_EMAILS`. Unauthorized DMs are ignored. Owner-visible DMs
-  with other people are ignored.
-* **Threaded replies** — by default, Hermes replies to the triggering
-  RingCentral post in a Team Messaging thread. Set `RC_REPLY_TO_MODE=off` to
-  keep replies as regular chat posts, or `all` to keep later reply chunks
-  threaded whenever Hermes supplies a reply anchor. RingCentral Direct chats
-  may accept the thread fields but still render replies as regular posts. Set
-  `RC_NO_THREAD_CHANNELS` to force regular posts in specific chats.
-* **Owner DM history** — when the owner asks the bot DM to summarize, search,
-  inspect, or answer questions about RingCentral chat history, Hermes Agent can
-  call the `ringcentral_get_recent_messages` tool. The tool uses `RC_USER_*` to
-  resolve and read recent messages from an owner-visible group, team, or direct
-  chat, then returns structured source messages. Hermes Agent handles intent,
-  target choice, time-window filtering, and the final answer.
-* **Group / Team chats** — the sender must be the owner email or listed in
-  `RC_ALLOWED_USER_EMAILS`, the chat must pass `RC_ALLOWED_CHANNELS` /
-  `RC_IGNORED_CHANNELS`, and the message must mention the bot or arrive in a
-  thread the bot already joined. Set `RC_REQUIRE_MENTION=false` or add chat IDs
-  to `RC_FREE_RESPONSE_CHANNELS` to allow authorized group messages without a
-  bot mention; set `RC_THREAD_REQUIRE_MENTION=true` to require mentions even in
-  joined threads. With owner mode, unauthorized group chatter is stored as
-  observed context for later owner requests, but never triggers the agent.
-* **Edits / deletes** — handled through `edit_message` / `delete_message`
-  hooks the agent uses for streaming-style responses. If a message was sent
-  via owner fallback, later edits/deletes use the owner identity too.
-* **Files** — inbound attachments (images, audio, documents) are downloaded
-  to the Hermes cache so the vision tool can pick them up by path.
-  Outbound media is uploaded via `POST /team-messaging/v1/files` and
-  attached to a follow-up post for the caption.
-* **Owner fallback** — outbound sends try the bot first. On permission or
-  membership failures (`401`, `403`, `404`), Hermes retries with the owner
-  identity when owner mode is configured.
-* **Rate limiting** — HTTP 429 responses are retried up to twice, honoring
-  the server's `Retry-After` header (capped at 30 s).
-* **Reconnect** — WebSocket disconnects trigger exponential backoff
-  (2 s → 60 s) with jitter. Permanent auth failures (HTTP 401 / 403)
-  stop the loop instead of looping forever.
+Mention the bot in a group/team chat:
 
-## Cron / notification delivery
+```text
+@Hermes summarize the decision in this thread
+```
 
-Set `RC_HOME_CHANNEL` to a chat or group ID and Hermes' cron scheduler
-will route `deliver=ringcentral` jobs there automatically — even when
-cron runs out-of-process from the gateway, courtesy of the plugin's
-standalone-sender hook.
+By default, group messages require a bot mention. You can allow selected
+channels to trigger without mentions by setting `RC_FREE_RESPONSE_CHANNELS`, or
+disable mention requirements globally with `RC_REQUIRE_MENTION=false`.
+
+### Owner history summaries
+
+From the owner-bot DM, ask Hermes for a group or DM summary in natural language:
+
+```text
+Summarize Project Team since yesterday.
+```
+
+```text
+总结我和 Alice Wang 今天的聊天
+```
+
+Hermes may call the `ringcentral_get_recent_messages` tool to fetch recent
+source messages visible to the owner. The plugin returns structured history;
+Hermes Agent decides the intent, target, time window, and final summary. Other
+users cannot use this tool to read history.
+
+### Cron and notifications
+
+Set `RC_HOME_CHANNEL` to route Hermes cron jobs and notifications into
+RingCentral:
+
+```text
+Create a daily 9am reminder and deliver it to RingCentral.
+```
+
+## Feature Highlights
+
+- **Hermes-native plugin install** via `hermes plugins install`.
+- **Bot-first messaging** for normal conversations, with optional owner fallback
+  when the bot is not in a target chat.
+- **Owner-only chat history tool** for group and direct-message summaries,
+  with intent and summarization handled by Hermes Agent.
+- **Thread replies** using RingCentral Team Messaging `parentPostId` /
+  `threadId` where supported.
+- **Discord-style controls** for allowed users, allowed channels, ignored
+  channels, mention requirements, free-response channels, and thread follow-up
+  behavior.
+- **Attachment handling** for inbound images, audio, and documents so Hermes
+  tools can work with downloaded files.
+- **Cron delivery** through `RC_HOME_CHANNEL`, including out-of-process cron
+  sender support.
+- **Webhook text fallback** for integration posts where the modern Team
+  Messaging posts API returns empty text.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| Gateway logs `RC_BOT_TOKEN not configured` | env var missing | `export RC_BOT_TOKEN=…` and restart |
-| Gateway logs `RingCentral rejected bot token` | bad / expired token | Re-issue the JWT from the dev portal |
-| Gateway logs owner auth failed | one of `RC_USER_*` is wrong or expired | Re-issue the owner JWT and verify client id/secret |
-| Owner DM history request says no owner credentials | `RC_USER_*` is incomplete | Set all three owner vars and restart |
-| Owner DM history request cannot find a chat/person | owner token cannot see the target, or the name is ambiguous | Use the exact group/person name, Person mention, or numeric ID |
-| WS keeps disconnecting with `HTTP 401` | bot lacks `WebSocketsSubscription` scope | Add the scope, reinstall the bot |
-| Posts succeed but bot never replies in a group | bot wasn't addressed, or sender is not owner in owner mode | Owner should mention the bot or use a `/` command |
-| Files arrive but no media surfaces | attachment download blocked by SSRF rule | Verify the chat is accessible to the bot |
+| --- | --- | --- |
+| Plugin does not load | Installed but not enabled | Run `hermes plugins enable ringcentral-platform` and restart the gateway |
+| Gateway logs `RC_BOT_TOKEN not configured` | Missing bot JWT | Set `RC_BOT_TOKEN` in `~/.hermes/.env` |
+| Gateway logs `RingCentral rejected bot token` | Bad or expired JWT | Re-issue the bot JWT in the RingCentral developer portal |
+| Owner history request says credentials are missing | `RC_USER_*` is incomplete | Set `RC_USER_CLIENT_ID`, `RC_USER_CLIENT_SECRET`, and `RC_USER_JWT_TOKEN` |
+| Bot does not reply in a group | No mention, blocked user, or blocked channel | Mention the bot and check `RC_ALLOWED_USER_EMAILS`, `RC_ALLOWED_CHANNELS`, and `RC_IGNORED_CHANNELS` |
+| Replies are not threaded in a chat | RingCentral UI/API behavior or channel disabled threads | Check `RC_REPLY_TO_MODE` and `RC_NO_THREAD_CHANNELS` |
 
-## Dependencies
+## Development
 
-```text
-aiohttp>=3.9.0
-websockets>=12.0
+Run the RingCentral test suite with Hermes Agent on `PYTHONPATH`:
+
+```sh
+PYTHONPATH=/root/workspace/github/NousResearch/hermes-agent \
+  uv run --with PyYAML --extra dev pytest -q tests/test_ringcentral.py
 ```
-
-Both are typically already installed; `aiohttp` ships with Hermes core and
-`websockets` is a transitive dep of several other adapters.
