@@ -2,10 +2,12 @@
 
 Owns the lifetime of the bot's WebSocket subscription:
 
-  1. Asks the REST client for a subscription token (``POST /restapi/v1.0/subscription``)
+  1. Asks the REST client for a one-use WebSocket token
+     (``POST /restapi/oauth/wstoken``)
   2. Connects to the returned WebSocket URI
-  3. Streams events to a user-supplied callback
-  4. Reconnects with exponential backoff + jitter on disconnect
+  3. Sends the subscription request as a WebSocket ``ClientRequest`` frame
+  4. Streams events to a user-supplied callback
+  5. Reconnects with exponential backoff + jitter on disconnect
 
 Echo dedup is handled by an explicit ``mark_own_post`` API: the adapter
 records every post ID it sends so the monitor can drop the inbound echo
@@ -19,8 +21,10 @@ import asyncio
 import json
 import logging
 import random
+import uuid
 from collections import deque
 from typing import Any, Awaitable, Callable, Deque, Optional, Set
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .rc_client import RingCentralClient
 
@@ -61,11 +65,15 @@ class RingCentralWebSocket:
         *,
         own_person_id: Optional[str] = None,
         event_filters: Optional[list] = None,
+        filter_own_creator: bool = True,
+        label: str = "bot",
     ) -> None:
         self._client = client
         self._on_event = on_event
         self._own_person_id: Optional[str] = str(own_person_id) if own_person_id else None
         self._event_filters = list(event_filters or DEFAULT_EVENT_FILTERS)
+        self._filter_own_creator = filter_own_creator
+        self._label = label or "bot"
 
         # Dedup: our own outbound post IDs. ``deque`` for O(1) FIFO bounds,
         # ``set`` for O(1) lookup — kept in sync.
@@ -148,7 +156,12 @@ class RingCentralWebSocket:
             except Exception as exc:  # noqa: BLE001
                 if self._closing:
                     return
-                logger.warning("RC WebSocket error: %s — reconnecting in %.0fs", exc, delay)
+                logger.warning(
+                    "RC WebSocket (%s) error: %s — reconnecting in %.0fs",
+                    self._label,
+                    exc,
+                    delay,
+                )
 
             if self._closing:
                 return
@@ -161,20 +174,18 @@ class RingCentralWebSocket:
         """Single WebSocket session: subscribe, connect, dispatch events."""
         import aiohttp
 
-        subscription = await self._client.create_websocket_subscription(
-            event_filters=self._event_filters,
-        )
-        if not subscription:
-            raise RuntimeError("RC subscription request failed")
+        token_info = await self._client.create_websocket_token()
+        if not token_info:
+            raise RuntimeError("RC WebSocket token request failed")
 
-        ws_uri = self._extract_ws_uri(subscription)
+        ws_uri = self._build_ws_uri(token_info)
         if not ws_uri:
             raise RuntimeError(
-                f"RC subscription response missing WebSocket URI: {subscription!r}"
+                f"RC WebSocket token response missing uri/access token: {token_info!r}"
             )
 
         session = await self._client._ensure_session()
-        logger.info("RC WebSocket: connecting to %s", _redact_ws_uri(ws_uri))
+        logger.info("RC WebSocket (%s): connecting to %s", self._label, _redact_ws_uri(ws_uri))
 
         try:
             self._ws = await session.ws_connect(ws_uri, heartbeat=30.0)
@@ -183,7 +194,8 @@ class RingCentralWebSocket:
                 raise _PermanentAuthError(f"HTTP {exc.status} on WS handshake") from exc
             raise
 
-        logger.info("RC WebSocket: connected")
+        logger.info("RC WebSocket (%s): connected", self._label)
+        await self._send_subscription_request()
 
         try:
             async for raw_msg in self._ws:
@@ -202,7 +214,7 @@ class RingCentralWebSocket:
                     aiohttp.WSMsgType.CLOSING,
                     aiohttp.WSMsgType.CLOSED,
                 }:
-                    logger.info("RC WebSocket: closed (%s)", raw_msg.type)
+                    logger.info("RC WebSocket (%s): closed (%s)", self._label, raw_msg.type)
                     return
         finally:
             self._ws = None
@@ -211,12 +223,12 @@ class RingCentralWebSocket:
     # Event dispatch + filtering
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, event: dict) -> None:
+    async def _dispatch(self, event: Any) -> None:
         """Filter system frames + own-message echoes, then call ``on_event``."""
         # RC sends control frames (heartbeats, connection-details, etc.) on
         # the same channel as event payloads. Real events have a ``body``
         # dict with the resource payload.
-        body = event.get("body") if isinstance(event, dict) else None
+        body = self._extract_event_body(event)
         if not isinstance(body, dict):
             return
 
@@ -230,7 +242,7 @@ class RingCentralWebSocket:
         creator_id = str(body.get("creatorId") or "")
 
         # Drop our own outbound echoes.
-        if self._own_person_id and creator_id == self._own_person_id:
+        if self._filter_own_creator and self._own_person_id and creator_id == self._own_person_id:
             return
         if post_id and self.is_own_post(post_id):
             return
@@ -245,20 +257,65 @@ class RingCentralWebSocket:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_ws_uri(subscription: dict) -> Optional[str]:
-        """Pull the WebSocket URI out of a subscription response.
-
-        RC nests it under ``deliveryMode.address`` for WebSocket transports.
-        """
-        if not isinstance(subscription, dict):
+    def _build_ws_uri(token_info: dict) -> Optional[str]:
+        """Compose the WebSocket URL from ``/restapi/oauth/wstoken`` output."""
+        if not isinstance(token_info, dict):
             return None
-        dm = subscription.get("deliveryMode") or {}
-        if isinstance(dm, dict):
-            uri = dm.get("address") or dm.get("uri")
-            if uri:
-                return str(uri)
-        # Some responses surface the URI at the top level — fall back to that.
-        return subscription.get("uri") or None
+        uri = str(token_info.get("uri") or "").strip()
+        access_token = str(token_info.get("ws_access_token") or "").strip()
+        if not uri or not access_token:
+            return None
+
+        parts = urlsplit(uri)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["access_token"] = access_token
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+
+    async def _send_subscription_request(self) -> None:
+        if self._ws is None:
+            raise RuntimeError("RC WebSocket not connected")
+
+        message = [
+            {
+                "type": "ClientRequest",
+                "messageId": str(uuid.uuid4()),
+                "method": "POST",
+                "path": "/restapi/v1.0/subscription/",
+            },
+            {
+                "eventFilters": self._event_filters,
+                "deliveryMode": {"transportType": "WebSocket"},
+            },
+        ]
+        await self._ws.send_str(json.dumps(message))
+        logger.info(
+            "RC WebSocket (%s): subscription request sent for %d event filter(s)",
+            self._label,
+            len(self._event_filters),
+        )
+
+    @staticmethod
+    def _extract_event_body(event: Any) -> Optional[dict]:
+        """Return the webhook-compatible payload body from an RC WS frame."""
+        if isinstance(event, list) and len(event) >= 2:
+            meta = event[0] if isinstance(event[0], dict) else {}
+            payload = event[1] if isinstance(event[1], dict) else {}
+            if meta.get("type") == "ClientResponse":
+                try:
+                    status = int(meta.get("status") or 0)
+                except (TypeError, ValueError):
+                    status = 0
+                if status >= 400:
+                    logger.warning("RC WebSocket subscription response %s: %s", status, payload)
+                return None
+            return payload.get("body") if isinstance(payload, dict) else None
+
+        if isinstance(event, dict):
+            return event.get("body") if isinstance(event.get("body"), dict) else None
+
+        return None
 
 
 class _PermanentAuthError(RuntimeError):

@@ -20,13 +20,29 @@ optional_env:
     description: "RingCentral API base URL (default: https://platform.ringcentral.com). Use https://platform.devtest.ringcentral.com for sandbox."
     prompt: "RingCentral server URL"
     password: false
+  - name: RC_USER_CLIENT_ID
+    description: "Owner OAuth app client ID. Enables owner-only group observation and fallback sends when paired with RC_USER_CLIENT_SECRET and RC_USER_JWT_TOKEN."
+    prompt: "Owner client ID"
+    password: false
+  - name: RC_USER_CLIENT_SECRET
+    description: "Owner OAuth app client secret. Optional; only used with RC_USER_CLIENT_ID and RC_USER_JWT_TOKEN."
+    prompt: "Owner client secret"
+    password: true
+  - name: RC_USER_JWT_TOKEN
+    description: "Owner JWT token. Optional; only used with RC_USER_CLIENT_ID and RC_USER_CLIENT_SECRET."
+    prompt: "Owner JWT token"
+    password: true
   - name: RC_ALLOWED_USERS
-    description: "Comma-separated RingCentral person IDs allowed to talk to the bot"
+    description: "Comma-separated RingCentral person IDs allowed to talk to the bot. If omitted and owner mode is configured, the owner ID is auto-seeded."
     prompt: "Allowed user IDs (comma-separated)"
     password: false
   - name: RC_ALLOW_ALL_USERS
     description: "Allow any RingCentral user to trigger the bot (dev only)"
     prompt: "Allow all users? (true/false)"
+    password: false
+  - name: RC_SUMMARY_MESSAGE_LIMIT
+    description: "Recent messages to fetch with the owner token for DM-triggered chat summaries (default: 250, max: 1000)."
+    prompt: "Summary message limit"
     password: false
   - name: RC_HOME_CHANNEL
     description: "Default chat/group ID for cron / notification delivery"
