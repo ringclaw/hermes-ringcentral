@@ -35,7 +35,7 @@ export RC_SERVER_URL="https://platform.ringcentral.com"
 export RC_USER_CLIENT_ID="<owner app client id>"
 export RC_USER_CLIENT_SECRET="<owner app client secret>"
 export RC_USER_JWT_TOKEN="<owner JWT>"
-# Optional owner-summary window. The plugin fetches this many recent group
+# Optional owner-summary window. The plugin fetches this many recent chat
 # messages and lets Hermes Agent produce the actual summary.
 export RC_SUMMARY_MESSAGE_LIMIT=250
 
@@ -66,10 +66,11 @@ the owner person ID.
 
 * **DMs** — authorized inbound posts are forwarded to the agent.
 * **Owner DM summaries** — the owner can DM the bot with
-  `/summarize <group name or chat id>` or `总结 <群名>`. The plugin uses
-  `RC_USER_*` to read recent messages from that owner-visible group, then
-  passes the formatted history to Hermes Agent. The plugin does not generate
-  summaries itself.
+  `/summarize <group/person/chat id>` or `总结 <群名或人名>`. The plugin uses
+  `RC_USER_*` to resolve and read recent messages from that owner-visible
+  group or direct chat, then passes the formatted history to Hermes Agent.
+  Natural-language target extraction falls back to Hermes plugin LLM access;
+  the plugin does not generate summaries itself.
 * **Group / Team chats** — without owner mode, the bot responds when
   explicitly addressed via `![:Person](<bot id>)`. With owner mode, only the
   owner can trigger Hermes; group messages must mention the bot or start with
@@ -106,8 +107,8 @@ standalone-sender hook.
 | Gateway logs `RC_BOT_TOKEN not configured` | env var missing | `export RC_BOT_TOKEN=…` and restart |
 | Gateway logs `RingCentral rejected bot token` | bad / expired token | Re-issue the JWT from the dev portal |
 | Gateway logs owner auth failed | one of `RC_USER_*` is wrong or expired | Re-issue the owner JWT and verify client id/secret |
-| `/summarize <group>` says no owner credentials | `RC_USER_*` is incomplete | Set all three owner vars and restart |
-| `/summarize <group>` cannot find a group | owner token cannot see that group or the name is ambiguous | Use the exact group name or numeric chat ID |
+| `/summarize <target>` says no owner credentials | `RC_USER_*` is incomplete | Set all three owner vars and restart |
+| `/summarize <target>` cannot find a chat/person | owner token cannot see the target, or the name is ambiguous | Use the exact group/person name, Person mention, or numeric ID |
 | WS keeps disconnecting with `HTTP 401` | bot lacks `WebSocketsSubscription` scope | Add the scope, reinstall the bot |
 | Posts succeed but bot never replies in a group | bot wasn't addressed, or sender is not owner in owner mode | Owner should mention the bot or use a `/` command |
 | Files arrive but no media surfaces | attachment download blocked by SSRF rule | Verify the chat is accessible to the bot |

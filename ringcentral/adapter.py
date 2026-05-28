@@ -69,6 +69,39 @@ _SUMMARY_KEYWORDS = ("summarize", "summarise", "summary", "总结")
 _DEFAULT_SUMMARY_MESSAGE_LIMIT = 250
 _MAX_SUMMARY_MESSAGE_LIMIT = 1000
 _SUMMARY_CONTEXT_CHAR_LIMIT = 60000
+_SUMMARY_TARGET_CONFIDENCE_THRESHOLD = 0.5
+
+_SUMMARY_TARGET_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target_text": {
+            "type": "string",
+            "description": "The exact RingCentral person, email, id, group, or team target mentioned by the user.",
+        },
+        "target_kind": {
+            "type": "string",
+            "enum": ["person", "chat", "unknown"],
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+        "reason": {
+            "type": "string",
+        },
+    },
+    "required": ["target_text", "target_kind", "confidence"],
+}
+
+_SUMMARY_TARGET_INTENT_INSTRUCTIONS = (
+    "Extract only the RingCentral chat/person target from an owner chat "
+    "summary request. The target may be a person name, email address, numeric "
+    "RingCentral id, group name, or team name. Do not include time ranges, "
+    "summary verbs, filler words, or relationship words. Do not infer or invent "
+    "a target that is not explicitly mentioned. If no target is clear, return "
+    "target_kind='unknown', target_text='', confidence=0."
+)
 
 _OBSERVED_CONTEXT_LIMIT = 20
 _OBSERVED_CONTEXT_CHAR_LIMIT = 8000
@@ -253,32 +286,20 @@ def _best_directory_match(
 def _summary_directory_search_terms(query: str) -> List[str]:
     raw = _RC_TYPED_MENTION_RE.sub("", query or "").strip(" \t\r\n:：,，")
     email_matches = re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", raw)
-    latin_names = [
-        match.group(0).strip()
-        for match in re.finditer(
-            r"\b[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*)*\b",
-            raw,
-        )
-    ]
-    clean = re.sub(
-        r"(?i)\b(today|yesterday|tomorrow|recent|from|since|last\s+\w+|"
-        r"this\s+week|this\s+month|last\s+week|last\s+month|"
-        r"messages?|chat|conversation|with|direct|dm|summary|summari[sz]e)\b",
-        " ",
-        raw,
-    )
-    clean = re.sub(
-        r"(今天|昨天|前天|最近(?:一|两|二|三|\d+)?天?|"
-        r"近(?:一|两|二|三|\d+)?天|过去(?:一|两|二|三|\d+)?天|"
-        r"这一周|这周|本周|上周|下周|一周|这(?:个)?月|本月|上月|"
-        r"我跟|跟我|和我|我和|我与|与我|"
-        r"消息|聊天|对话|私聊|总结|一下|的|跟|和|与|我)",
-        " ",
-        clean,
-    )
-    clean = re.sub(r"[，。！？,!?;；:：]+", " ", clean)
+    latin_names: List[str] = []
+    current: List[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z.'-]*", raw):
+        if token[:1].isupper():
+            current.append(token)
+            continue
+        if current:
+            latin_names.append(" ".join(current))
+            current = []
+    if current:
+        latin_names.append(" ".join(current))
+
     terms: List[str] = []
-    for term in [*email_matches, *latin_names, clean.strip(), raw]:
+    for term in [*email_matches, *latin_names, raw]:
         if term and term not in terms:
             terms.append(term)
     return terms
@@ -352,10 +373,11 @@ _RC_PLATFORM = _ensure_ringcentral_platform()
 class RingCentralAdapter(BasePlatformAdapter):
     """Gateway adapter for RingCentral Team Messaging."""
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, intent_llm: Any = None):
         super().__init__(config, _RC_PLATFORM)
 
         extra = getattr(config, "extra", {}) or {}
+        self._intent_llm = intent_llm
 
         self._token: str = (
             (config.token or "")
@@ -1067,6 +1089,41 @@ class RingCentralAdapter(BasePlatformAdapter):
                 records[chat_id] = chat
         return list(records.values())
 
+    def _match_owner_group_chat(
+        self,
+        chats: List[Dict[str, Any]],
+        query: str,
+    ) -> Optional[Dict[str, Any]]:
+        qnorm = _normalize_chat_label(query)
+        if not qnorm:
+            return None
+
+        candidates: List[tuple[int, Dict[str, Any]]] = []
+        fuzzy: List[tuple[int, Dict[str, Any]]] = []
+        query_stripped = (query or "").strip()
+        for chat in chats:
+            name = str(chat.get("name") or "")
+            name_norm = _normalize_chat_label(name)
+            chat_id = _rc_chat_id_from(chat)
+            if chat_id == query_stripped:
+                return self._chat_info_from_record(chat)
+            if not name_norm:
+                continue
+            if name_norm == qnorm:
+                return self._chat_info_from_record(chat)
+            if name_norm in qnorm:
+                candidates.append((len(name_norm), chat))
+            elif qnorm in name_norm:
+                fuzzy.append((len(qnorm), chat))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            return self._chat_info_from_record(candidates[0][1])
+        if fuzzy:
+            fuzzy.sort(key=lambda item: item[0], reverse=True)
+            return self._chat_info_from_record(fuzzy[0][1])
+        return None
+
     async def _owner_get_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
         if self._owner_client is None or not chat_id:
             return None
@@ -1133,13 +1190,22 @@ class RingCentralAdapter(BasePlatformAdapter):
             "person_id": person_id,
         }
 
-    async def _owner_search_direct_chat(self, query: str) -> Optional[Dict[str, Any]]:
+    async def _owner_search_direct_chat(
+        self,
+        query: str,
+        *,
+        terms: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         if self._owner_client is None:
             return None
         search = getattr(self._owner_client, "search_directory", None)
         if not callable(search):
             return None
-        for term in _summary_directory_search_terms(query):
+        search_terms = terms if terms is not None else _summary_directory_search_terms(query)
+        for term in search_terms:
+            term = str(term or "").strip()
+            if not term:
+                continue
             try:
                 entries = await search(term)
             except Exception as exc:
@@ -1162,6 +1228,66 @@ class RingCentralAdapter(BasePlatformAdapter):
             if chat:
                 return chat
         return None
+
+    async def _extract_summary_target_with_llm(
+        self,
+        *,
+        query: str,
+        raw_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        complete_structured = getattr(self._intent_llm, "acomplete_structured", None)
+        if not callable(complete_structured):
+            return None
+        try:
+            result = await complete_structured(
+                instructions=_SUMMARY_TARGET_INTENT_INSTRUCTIONS,
+                input=[{
+                    "type": "text",
+                    "text": (
+                        "RingCentral owner summary request:\n"
+                        f"raw_text: {raw_text or ''}\n"
+                        f"query_after_summary_keyword: {query or ''}"
+                    ),
+                }],
+                json_schema=_SUMMARY_TARGET_INTENT_SCHEMA,
+                schema_name="ringcentral.summary_target",
+                purpose="ringcentral-summary-target",
+                temperature=0.0,
+                max_tokens=200,
+            )
+        except Exception as exc:
+            logger.debug("RingCentral: summary target LLM extraction failed: %s", exc)
+            return None
+
+        parsed = getattr(result, "parsed", None)
+        if not isinstance(parsed, dict):
+            return None
+
+        target_text = str(parsed.get("target_text") or "").strip(" \t\r\n:：,，")
+        target_kind = str(parsed.get("target_kind") or "unknown").strip().lower()
+        if target_kind in {"group", "team"}:
+            target_kind = "chat"
+        elif target_kind in {"direct", "dm", "user"}:
+            target_kind = "person"
+        try:
+            confidence = float(parsed.get("confidence", 0))
+        except (TypeError, ValueError):
+            confidence = 0
+
+        if (
+            not target_text
+            or target_kind not in {"person", "chat"}
+            or confidence < _SUMMARY_TARGET_CONFIDENCE_THRESHOLD
+        ):
+            return None
+        if len(target_text) > 200:
+            return None
+        return {
+            "target_text": target_text,
+            "target_kind": target_kind,
+            "confidence": confidence,
+            "reason": str(parsed.get("reason") or ""),
+        }
 
     async def _resolve_owner_summary_chat(
         self,
@@ -1207,31 +1333,41 @@ class RingCentralAdapter(BasePlatformAdapter):
                 "for example: /summarize Project Team or /summarize Alice"
             )
 
-        candidates: List[tuple[int, Dict[str, Any]]] = []
-        fuzzy: List[tuple[int, Dict[str, Any]]] = []
-        for chat in chats:
-            name = str(chat.get("name") or "")
-            name_norm = _normalize_chat_label(name)
-            chat_id = _rc_chat_id_from(chat)
-            if not name_norm:
-                continue
-            if name_norm == qnorm or chat_id == query.strip():
-                return self._chat_info_from_record(chat), None
-            if name_norm in qnorm:
-                candidates.append((len(name_norm), chat))
-            elif qnorm in name_norm:
-                fuzzy.append((len(qnorm), chat))
-
-        if candidates:
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            return self._chat_info_from_record(candidates[0][1]), None
-        if fuzzy:
-            fuzzy.sort(key=lambda item: item[0], reverse=True)
-            return self._chat_info_from_record(fuzzy[0][1]), None
+        chat = self._match_owner_group_chat(chats, query)
+        if chat:
+            return chat, None
 
         direct = await self._owner_search_direct_chat(query)
         if direct:
             return direct, None
+
+        intent = await self._extract_summary_target_with_llm(
+            query=query,
+            raw_text=raw_text,
+        )
+        if intent:
+            target_text = str(intent["target_text"])
+            target_kind = str(intent["target_kind"])
+            if target_kind == "person":
+                direct = await self._owner_search_direct_chat(
+                    target_text,
+                    terms=[target_text],
+                )
+                if direct:
+                    return direct, None
+                chat = self._match_owner_group_chat(chats, target_text)
+                if chat:
+                    return chat, None
+            else:
+                chat = self._match_owner_group_chat(chats, target_text)
+                if chat:
+                    return chat, None
+                direct = await self._owner_search_direct_chat(
+                    target_text,
+                    terms=[target_text],
+                )
+                if direct:
+                    return direct, None
 
         return None, f"Could not find an owner-visible RingCentral group or person matching {query!r}."
 
@@ -2010,10 +2146,17 @@ async def _standalone_send(
 
 def register(ctx) -> None:
     """Hermes plugin entry point."""
+    def _build_adapter(cfg: PlatformConfig) -> RingCentralAdapter:
+        try:
+            intent_llm = getattr(ctx, "llm", None)
+        except Exception:
+            intent_llm = None
+        return RingCentralAdapter(cfg, intent_llm=intent_llm)
+
     ctx.register_platform(
         name="ringcentral",
         label="RingCentral",
-        adapter_factory=lambda cfg: RingCentralAdapter(cfg),
+        adapter_factory=_build_adapter,
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=_is_connected,

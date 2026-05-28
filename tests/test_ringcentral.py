@@ -223,10 +223,14 @@ class TestSummaryConfig:
         assert _summary_message_limit_from({"summary_message_limit": "5000"}) == 1000
         assert _summary_message_limit_from({"summary_message_limit": "bad"}) == 250
 
-    def test_summary_directory_terms_extract_latin_name_from_chinese_request(self):
+    def test_summary_directory_terms_extract_name_candidate_without_stopwords(self):
         terms = _summary_directory_search_terms("我跟 Justin Wu 这一周的聊天")
         assert terms[0] == "Justin Wu"
         assert "我跟 Justin Wu 这一周的聊天" in terms
+
+    def test_summary_directory_terms_keep_chinese_request_for_llm_fallback(self):
+        terms = _summary_directory_search_terms("我跟张三这一周的聊天")
+        assert terms == ["我跟张三这一周的聊天"]
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +510,14 @@ class TestAdapterInit:
         adapter = RingCentralAdapter(cfg)
         assert adapter._summary_message_limit == 333
 
+    def test_accepts_intent_llm_from_plugin_context(self):
+        from gateway.config import PlatformConfig
+
+        llm = object()
+        cfg = PlatformConfig(enabled=True, token="t", extra={})
+        adapter = RingCentralAdapter(cfg, intent_llm=llm)
+        assert adapter._intent_llm is llm
+
     def test_name_is_ringcentral(self):
         adapter = _make_adapter()
         assert adapter.name == "RingCentral"
@@ -518,6 +530,30 @@ class TestAdapterInit:
         adapter._seed_owner_allowlist()
         assert adapter._owner_only_gate_enabled is True
         assert os.environ["RC_ALLOWED_USERS"] == "owner-1"
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration
+# ---------------------------------------------------------------------------
+
+
+class TestPluginRegistration:
+    def test_register_passes_context_llm_to_adapter_factory(self):
+        from gateway.config import PlatformConfig
+
+        class Ctx:
+            llm = object()
+
+            def register_platform(self, **kwargs):
+                self.kwargs = kwargs
+
+        ctx = Ctx()
+        register(ctx)
+        adapter = ctx.kwargs["adapter_factory"](
+            PlatformConfig(enabled=True, token="t", extra={}),
+        )
+
+        assert adapter._intent_llm is ctx.llm
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +893,99 @@ class TestOwnerDMSummary:
         owner.list_posts.assert_awaited_once_with("dm-alice", record_count=250)
         event = adapter.handle_message.await_args.args[0]
         assert "Target chat: Alice Wang (id: dm-alice)" in event.channel_context
+
+    def test_owner_dm_summary_uses_llm_target_extraction_for_chinese_person(self):
+        adapter, owner = self._summary_adapter()
+        llm_result = MagicMock(parsed={
+            "target_text": "张三",
+            "target_kind": "person",
+            "confidence": 0.92,
+            "reason": "explicit person name",
+        })
+        adapter._intent_llm = MagicMock()
+        adapter._intent_llm.acomplete_structured = AsyncMock(return_value=llm_result)
+
+        async def search_directory(term):
+            if term == "张三":
+                return [{
+                    "id": "20004",
+                    "firstName": "张",
+                    "lastName": "三",
+                    "email": "zhangsan@example.com",
+                }]
+            return []
+
+        owner.search_directory = AsyncMock(side_effect=search_directory)
+        owner.create_or_find_dm = AsyncMock(return_value={
+            "id": "dm-zhangsan",
+            "type": "Direct",
+        })
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-trigger",
+            "groupId": "dm-1",
+            "creatorId": "owner-1",
+            "text": "总结 我跟张三这一周的聊天",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter._intent_llm.acomplete_structured.assert_awaited_once()
+        assert owner.search_directory.await_args_list[0].args == ("我跟张三这一周的聊天",)
+        assert owner.search_directory.await_args_list[-1].args == ("张三",)
+        owner.create_or_find_dm.assert_awaited_once_with(["20004"])
+        owner.list_posts.assert_awaited_once_with("dm-zhangsan", record_count=250)
+        event = adapter.handle_message.await_args.args[0]
+        assert "Target chat: 张 三 (id: dm-zhangsan)" in event.channel_context
+
+    def test_summary_target_llm_not_called_for_explicit_person_mention(self):
+        adapter, owner = self._summary_adapter()
+        adapter._intent_llm = MagicMock()
+        adapter._intent_llm.acomplete_structured = AsyncMock()
+        owner.create_or_find_dm = AsyncMock(return_value={
+            "id": "dm-user-1",
+            "type": "Direct",
+        })
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-trigger",
+            "groupId": "dm-1",
+            "creatorId": "owner-1",
+            "text": "/summarize ![:Person](20001) 今天",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter._intent_llm.acomplete_structured.assert_not_awaited()
+        owner.create_or_find_dm.assert_awaited_once_with(["20001"])
+        owner.list_posts.assert_awaited_once_with("dm-user-1", record_count=250)
+
+    def test_summary_target_llm_low_confidence_fails_closed(self):
+        adapter, owner = self._summary_adapter()
+        adapter._send_chunks = AsyncMock(return_value=MagicMock(success=True))
+        adapter._intent_llm = MagicMock()
+        adapter._intent_llm.acomplete_structured = AsyncMock(return_value=MagicMock(
+            parsed={
+                "target_text": "张三",
+                "target_kind": "person",
+                "confidence": 0.2,
+            },
+        ))
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-trigger",
+            "groupId": "dm-1",
+            "creatorId": "owner-1",
+            "text": "总结 我跟张三这一周的聊天",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="owner"))
+
+        adapter._intent_llm.acomplete_structured.assert_awaited_once()
+        owner.list_posts.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+        adapter._send_chunks.assert_awaited_once()
+        assert "Could not find" in adapter._send_chunks.await_args.args[1]
 
     def test_owner_dm_summary_resolves_numeric_user_id_to_direct_chat(self):
         adapter, owner = self._summary_adapter()

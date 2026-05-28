@@ -41,7 +41,7 @@ optional_env:
     prompt: "Allow all users? (true/false)"
     password: false
   - name: RC_SUMMARY_MESSAGE_LIMIT
-    description: "Recent messages to fetch with the owner token for DM-triggered group summaries (default: 250, max: 1000)."
+    description: "Recent messages to fetch with the owner token for DM-triggered chat summaries (default: 250, max: 1000)."
     prompt: "Summary message limit"
     password: false
   - name: RC_HOME_CHANNEL
