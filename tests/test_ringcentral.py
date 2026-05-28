@@ -809,10 +809,15 @@ class TestOwnerDMSummary:
         assert event.message_type == _rc_mod.MessageType.TEXT
         assert not event.text.startswith("/")
         assert "Summarize the RingCentral chat history" in event.text
+        assert "First determine the requested time range" in event.text
         assert "Project Team" in event.channel_context
+        assert "Current gateway time:" in event.channel_context
+        assert "Message timestamps are shown as local gateway time followed by UTC" in event.channel_context
+        assert "/ 2026-05-28 02:10 UTC" in event.channel_context
         assert "Owner (owner-1): please deploy" in event.channel_context
         assert "Alice (user-2): deployment finished" in event.channel_context
         assert "owner's RC_USER credentials" in event.channel_prompt
+        assert "filter the provided messages by their timestamps" in event.channel_prompt
         owner.list_legacy_group_posts.assert_not_awaited()
         metadata = event.raw_message["ringcentral_summary"]
         assert metadata["post_source"] == "team_messaging"
