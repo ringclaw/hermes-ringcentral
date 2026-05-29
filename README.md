@@ -81,6 +81,8 @@ export RC_THREAD_REQUIRE_MENTION=false
 # Threading and delivery.
 export RC_REPLY_TO_MODE=first
 export RC_NO_THREAD_CHANNELS="g-announcements"
+export RC_PROCESSING_EMOJI_ENABLED=true
+export RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS=5
 export RC_HOME_CHANNEL="g-abc123"
 export RC_HOME_CHANNEL_NAME="Hermes Updates"
 ```
@@ -148,6 +150,8 @@ Create a daily 9am reminder and deliver it to RingCentral.
   with intent and summarization handled by Hermes Agent.
 - **Thread replies** using RingCentral Team Messaging `parentPostId` /
   `threadId` where supported.
+- **Waiting emoji in threads**: Hermes posts `👀`, edits it to `⏳` after a
+  short delay, then deletes it when the final reply is delivered.
 - **Discord-style controls** for allowed users, allowed channels, ignored
   channels, mention requirements, free-response channels, and thread follow-up
   behavior.

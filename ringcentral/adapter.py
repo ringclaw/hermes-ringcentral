@@ -24,6 +24,8 @@ Configure via env vars::
     RC_FREE_RESPONSE_CHANNELS  Chat IDs where group messages do not need mention
     RC_THREAD_REQUIRE_MENTION  true/false — require mention in participated threads
     RC_NO_THREAD_CHANNELS  Chat IDs where outbound replies are regular posts
+    RC_PROCESSING_EMOJI_ENABLED  true/false — show a temporary waiting post
+    RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS  Delay before editing waiting emoji
     RC_HOME_CHANNEL        Default chat ID for cron / notification delivery
     RC_HOME_CHANNEL_NAME   Display name for the home chat
     RC_HISTORY_MESSAGE_LIMIT  Default recent-message window for the history tool
@@ -32,6 +34,7 @@ Configure via env vars::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 import json
 import logging
@@ -46,6 +49,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_audio_from_bytes,
     cache_document_from_bytes,
@@ -80,6 +84,8 @@ _REQUIRE_MENTION_ENV = "RC_REQUIRE_MENTION"
 _FREE_RESPONSE_CHANNELS_ENV = "RC_FREE_RESPONSE_CHANNELS"
 _THREAD_REQUIRE_MENTION_ENV = "RC_THREAD_REQUIRE_MENTION"
 _NO_THREAD_CHANNELS_ENV = "RC_NO_THREAD_CHANNELS"
+_PROCESSING_EMOJI_ENABLED_ENV = "RC_PROCESSING_EMOJI_ENABLED"
+_PROCESSING_EMOJI_EDIT_DELAY_ENV = "RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS"
 
 _DEFAULT_HISTORY_MESSAGE_LIMIT = 250
 _MAX_HISTORY_MESSAGE_LIMIT = 1000
@@ -87,6 +93,9 @@ _HISTORY_CONTEXT_CHAR_LIMIT = 60000
 _DEFAULT_REPLY_TO_MODE = "first"
 _REPLY_TO_MODES = {"off", "first", "all"}
 _PARENT_THREAD_PREFIX = "parentPostId:"
+_PROCESSING_EMOJI_INITIAL = "👀"
+_PROCESSING_EMOJI_DELAYED = "⏳"
+_DEFAULT_PROCESSING_EMOJI_EDIT_DELAY_SECONDS = 5.0
 
 _RINGCENTRAL_HISTORY_TOOL_NAME = "ringcentral_get_recent_messages"
 _RINGCENTRAL_HISTORY_SCHEMA = {
@@ -288,6 +297,25 @@ def _require_mention() -> bool:
 
 def _thread_require_mention() -> bool:
     return _env_bool(_THREAD_REQUIRE_MENTION_ENV, False)
+
+
+def _processing_emoji_enabled() -> bool:
+    return _env_bool(_PROCESSING_EMOJI_ENABLED_ENV, True)
+
+
+def _processing_emoji_edit_delay_seconds(extra: Dict[str, Any]) -> float:
+    raw = extra.get("processing_emoji_edit_delay_seconds")
+    if raw in (None, ""):
+        raw = os.getenv(_PROCESSING_EMOJI_EDIT_DELAY_ENV, "")
+    if raw in (None, ""):
+        return _DEFAULT_PROCESSING_EMOJI_EDIT_DELAY_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_PROCESSING_EMOJI_EDIT_DELAY_SECONDS
+    if value < 0 or value != value:
+        return _DEFAULT_PROCESSING_EMOJI_EDIT_DELAY_SECONDS
+    return value
 
 
 def _channel_set_matches(channels: set[str], chat_id: str) -> bool:
@@ -506,6 +534,8 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._owner_credentials = _owner_credentials_from(extra)
         self._history_message_limit = _history_message_limit_from(extra)
         self._reply_to_mode = _reply_to_mode_from(extra)
+        self._processing_emoji_enabled = _processing_emoji_enabled()
+        self._processing_emoji_edit_delay = _processing_emoji_edit_delay_seconds(extra)
 
         self._client: Optional[RingCentralClient] = None
         self._owner_client: Optional[RingCentralClient] = None
@@ -523,6 +553,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         # Track our outbound messages so streaming edits target the right
         # client after an owner fallback.
         self._sent_message_identity: Dict[str, str] = {}
+        self._processing_emoji_posts: Dict[str, str] = {}
+        self._processing_emoji_edit_tasks: Dict[str, asyncio.Task] = {}
+        self._processing_emoji_thread_ids: Dict[str, str] = {}
 
         self._dedup = MessageDeduplicator()
         self._threads = ThreadParticipationTracker("ringcentral")
@@ -774,6 +807,12 @@ class RingCentralAdapter(BasePlatformAdapter):
         if not reply_to_id:
             return None, None
 
+        processing_thread_id = self._processing_emoji_thread_ids.get(
+            f"{chat_id}:{reply_to_id}"
+        )
+        if processing_thread_id:
+            return None, processing_thread_id
+
         if self._reply_to_mode == "first" and reply_to_id in self._sent_message_identity:
             return None, None
 
@@ -1015,6 +1054,149 @@ class RingCentralAdapter(BasePlatformAdapter):
         # keeps the base class's typing heartbeat happy without burning API
         # quota on a request that does nothing.
         return None
+
+    def _processing_emoji_key(self, event: MessageEvent) -> str:
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        message_id = str(
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or ""
+        ).strip()
+        if not chat_id or not message_id:
+            return ""
+        return f"{chat_id}:{message_id}"
+
+    @staticmethod
+    def _processing_emoji_metadata(event: MessageEvent) -> Optional[Dict[str, Any]]:
+        source = getattr(event, "source", None)
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        if not thread_id:
+            return None
+        return {"thread_id": thread_id}
+
+    async def _edit_processing_emoji_after_delay(
+        self,
+        key: str,
+        chat_id: str,
+        message_id: str,
+        delay_seconds: float,
+    ) -> None:
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            if self._processing_emoji_posts.get(key) != message_id:
+                return
+            result = await self.edit_message(
+                chat_id,
+                message_id,
+                _PROCESSING_EMOJI_DELAYED,
+            )
+            if not result.success:
+                logger.debug(
+                    "RingCentral: processing emoji edit failed: chat=%s post=%s error=%s",
+                    chat_id,
+                    message_id,
+                    result.error or "unknown",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "RingCentral: processing emoji edit failed: chat=%s post=%s error=%s",
+                chat_id,
+                message_id,
+                exc,
+            )
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        if not self._processing_emoji_enabled:
+            return
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        reply_to = str(
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or ""
+        ).strip()
+        key = self._processing_emoji_key(event)
+        if (
+            not chat_id
+            or not reply_to
+            or not key
+            or key in self._processing_emoji_posts
+        ):
+            return
+
+        result = await self.send(
+            chat_id,
+            _PROCESSING_EMOJI_INITIAL,
+            reply_to=reply_to,
+            metadata=self._processing_emoji_metadata(event),
+        )
+        if not result.success or not result.message_id:
+            logger.debug(
+                "RingCentral: processing emoji send failed: chat=%s anchor=%s error=%s",
+                chat_id,
+                reply_to,
+                result.error or "unknown",
+            )
+            return
+
+        message_id = str(result.message_id)
+        self._processing_emoji_posts[key] = message_id
+        if isinstance(result.raw_response, dict):
+            thread_id = str(result.raw_response.get("thread_id") or "").strip()
+            if thread_id:
+                self._processing_emoji_thread_ids[key] = thread_id
+        self._processing_emoji_edit_tasks[key] = asyncio.create_task(
+            self._edit_processing_emoji_after_delay(
+                key,
+                chat_id,
+                message_id,
+                self._processing_emoji_edit_delay,
+            )
+        )
+
+    async def on_processing_complete(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        if not self._processing_emoji_enabled:
+            return
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        key = self._processing_emoji_key(event)
+        if not chat_id or not key:
+            return
+
+        self._processing_emoji_thread_ids.pop(key, None)
+        task = self._processing_emoji_edit_tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        message_id = self._processing_emoji_posts.pop(key, None)
+        if not message_id:
+            return
+        try:
+            deleted = await self.delete_message(chat_id, message_id)
+            if not deleted:
+                logger.debug(
+                    "RingCentral: processing emoji delete failed: chat=%s post=%s outcome=%s",
+                    chat_id,
+                    message_id,
+                    outcome.value,
+                )
+        except Exception as exc:
+            logger.debug(
+                "RingCentral: processing emoji delete failed: chat=%s post=%s error=%s",
+                chat_id,
+                message_id,
+                exc,
+            )
 
     async def edit_message(
         self,

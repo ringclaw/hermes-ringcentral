@@ -74,6 +74,14 @@ optional_env:
     description: "Threaded reply mode for RingCentral posts: first (default), all, or off."
     prompt: "Reply-to mode"
     password: false
+  - name: RC_PROCESSING_EMOJI_ENABLED
+    description: "Show a temporary waiting emoji post while Hermes is processing a RingCentral message (default: true)."
+    prompt: "Processing emoji enabled? (true/false)"
+    password: false
+  - name: RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS
+    description: "Seconds before editing the waiting emoji from eyes to hourglass (default: 5)."
+    prompt: "Processing emoji edit delay"
+    password: false
   - name: RC_HOME_CHANNEL
     description: "Default chat/group ID for cron and notification delivery."
     prompt: "Home chat ID"

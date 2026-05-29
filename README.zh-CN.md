@@ -80,6 +80,8 @@ export RC_THREAD_REQUIRE_MENTION=false
 # Thread 回复和通知投递。
 export RC_REPLY_TO_MODE=first
 export RC_NO_THREAD_CHANNELS="g-announcements"
+export RC_PROCESSING_EMOJI_ENABLED=true
+export RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS=5
 export RC_HOME_CHANNEL="g-abc123"
 export RC_HOME_CHANNEL_NAME="Hermes Updates"
 ```
@@ -138,6 +140,7 @@ Hermes 会根据需要调用 `ringcentral_get_recent_messages` 工具，使用 o
 - **总结逻辑交给 Hermes Agent**：插件提供消息材料，不硬编码意图、目标和时间段解析。
 - **Owner fallback 发送**：bot 不在某个群或权限不足时，可用 owner 身份 fallback 发送。
 - **Thread 回复**：支持 RingCentral Team Messaging 的 `parentPostId` / `threadId`。
+- **Thread 等待 emoji**：Hermes 会先回复 `👀`，短暂等待后 edit 为 `⏳`，最终回复送达后删除等待消息。
 - **Discord 风格权限控制**：支持 allowed users、allowed channels、ignored channels、mention required、free-response channels 和 thread follow-up 策略。
 - **附件处理**：图片、音频、文档会下载到 Hermes 缓存，供视觉或文件工具继续处理。
 - **Cron 投递**：通过 `RC_HOME_CHANNEL` 把定时任务和通知送到 RingCentral。
