@@ -322,6 +322,36 @@ class TestStripRCMentions:
         assert "![:Person]" not in result
         assert "hello" in result
 
+    def test_preserve_mode_keeps_target_mention(self):
+        text = "总结 ![:Team](987654321000) 最近一天"
+        assert (
+            _strip_rc_mentions(
+                text,
+                self.BOT_ID,
+                preserve_non_bot_mentions=True,
+            )
+            == text
+        )
+
+    def test_preserve_mode_strips_bot_mention_but_keeps_target_mention(self):
+        text = f"![:Person]({self.BOT_ID}) 总结 ![:Team](987654321000) 最近一天"
+        assert _strip_rc_mentions(
+            text,
+            self.BOT_ID,
+            preserve_non_bot_mentions=True,
+        ) == "总结 ![:Team](987654321000) 最近一天"
+
+    def test_preserve_mode_keeps_leading_non_bot_mention(self):
+        text = "![:Team](987654321000) 最近一天总结"
+        assert (
+            _strip_rc_mentions(
+                text,
+                self.BOT_ID,
+                preserve_non_bot_mentions=True,
+            )
+            == text
+        )
+
 
 # ---------------------------------------------------------------------------
 # History tool config
@@ -1038,6 +1068,7 @@ class TestProcessingEmoji:
         client = MagicMock()
         client.send_post = AsyncMock(side_effect=[
             {"id": "p-wait", "threadId": "t-1"},
+            {"id": "p-status", "threadId": "t-1"},
             {"id": "p-final", "threadId": "t-1"},
         ])
         client.update_post = AsyncMock(return_value={"id": "p-wait"})
@@ -1049,6 +1080,7 @@ class TestProcessingEmoji:
             await adapter.on_processing_start(event)
             assert adapter._processing_emoji_posts == {"g-1:p-parent": "p-wait"}
             assert adapter._processing_emoji_thread_ids == {"g-1:p-parent": "t-1"}
+            await adapter.send("g-1", "🗜️ Compacting context")
             await adapter.send("g-1", "final", reply_to="p-parent")
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -1058,13 +1090,20 @@ class TestProcessingEmoji:
         assert client.send_post.await_args_list[0].kwargs == {
             "parent_post_id": "p-parent"
         }
-        assert client.send_post.await_args_list[1].args == ("g-1", "final")
+        assert client.send_post.await_args_list[1].args == (
+            "g-1",
+            "🗜️ Compacting context",
+        )
         assert client.send_post.await_args_list[1].kwargs == {"thread_id": "t-1"}
+        assert client.send_post.await_args_list[2].args == ("g-1", "final")
+        assert client.send_post.await_args_list[2].kwargs == {"thread_id": "t-1"}
         client.delete_post.assert_awaited_once_with("g-1", "p-wait")
         client.update_post.assert_not_awaited()
         assert adapter._processing_emoji_posts == {}
         assert adapter._processing_emoji_edit_tasks == {}
         assert adapter._processing_emoji_thread_ids == {}
+        assert adapter._processing_thread_routes == {}
+        assert adapter._processing_keys_by_chat == {}
 
     def test_processing_start_posts_waiting_emoji_with_parent_post_id(self, monkeypatch):
         monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "true")
@@ -1131,6 +1170,29 @@ class TestProcessingEmoji:
         client.send_post.assert_not_awaited()
         assert adapter._processing_emoji_posts == {}
         assert adapter._processing_emoji_edit_tasks == {}
+
+    def test_unanchored_status_threads_while_processing_emoji_disabled(self, monkeypatch):
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "false")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-status", "threadId": "t-1"})
+        adapter._client = client
+        event = _make_message_event(adapter)
+
+        async def run():
+            await adapter.on_processing_start(event)
+            await adapter.send("g-1", "🗜️ Compacting context")
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        asyncio.run(run())
+
+        client.send_post.assert_awaited_once_with(
+            "g-1",
+            "🗜️ Compacting context",
+            parent_post_id="p-parent",
+        )
+        assert adapter._processing_thread_routes == {}
+        assert adapter._processing_keys_by_chat == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1960,6 +2022,26 @@ class TestRingCentralHistoryTool:
         bot.close.assert_awaited_once()
         owner.close.assert_awaited_once()
 
+    def test_owner_dm_tool_resolves_typed_team_mention_to_group_history(self, monkeypatch):
+        bot, owner = self._clients()
+
+        result = self._call_tool_with_clients(
+            monkeypatch,
+            bot,
+            owner,
+            {"target": "![:Team](555555555555)"},
+        )
+
+        assert result["success"] is True
+        assert result["target_chat"] == {
+            "id": "555555555555",
+            "name": "Project Team",
+            "type": "group",
+            "person_id": "",
+        }
+        owner.list_posts.assert_awaited_once_with("555555555555", record_count=250)
+        owner.list_recent_chats.assert_not_awaited()
+
     def test_owner_dm_tool_resolves_directory_person_to_direct_history(self, monkeypatch):
         bot, owner = self._clients()
         owner.search_directory = AsyncMock(return_value=[{
@@ -2152,6 +2234,43 @@ class TestRingCentralHistoryTool:
         assert event.message_type == _rc_mod.MessageType.TEXT
         assert event.text == "总结 Project Team 最近一天"
         assert _RINGCENTRAL_HISTORY_TOOL_NAME in event.channel_prompt
+        assert "current owner message" in event.channel_prompt
+        assert "previous tool results" in event.channel_prompt
+        assert "ask the owner to clarify" in event.channel_prompt
+
+    def test_owner_dm_message_preserves_ringcentral_target_mention(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "owner@example.com")
+        adapter = _make_adapter()
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value={
+            "id": "dm-1",
+            "type": "Direct",
+            "members": [{"id": "owner-1"}, {"id": "bot-1"}],
+        })
+        bot.list_chats = AsyncMock(return_value=[])
+        bot.get_person = AsyncMock(return_value={
+            "firstName": "Owner",
+            "email": "owner@example.com",
+        })
+        adapter._client = bot
+        adapter._own_person_id = "bot-1"
+        adapter._owner_person_id = "owner-1"
+        adapter._owner_email = "owner@example.com"
+        adapter._owner_only_gate_enabled = True
+        adapter.handle_message = AsyncMock()
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-trigger",
+            "chatId": "dm-1",
+            "creatorId": "owner-1",
+            "text": "总结 ![:Team](987654321000) 最近一天",
+        }
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "总结 ![:Team](987654321000) 最近一天"
 
 
 # ---------------------------------------------------------------------------

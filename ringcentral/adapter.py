@@ -147,6 +147,13 @@ _RINGCENTRAL_OWNER_DM_TOOL_PROMPT = (
     f"- If the owner asks to summarize, search, inspect, or answer questions "
     f"about RingCentral chat history, call the {_RINGCENTRAL_HISTORY_TOOL_NAME} "
     "tool with the exact target person or chat.\n"
+    "- Resolve each new history request from the current owner message. Do not "
+    "answer a new chat-history request from previous tool results or prior "
+    "conversation context unless the owner explicitly asks to continue with the "
+    "same chat.\n"
+    "- If the current owner message does not identify a target chat, person, "
+    "email, chat ID, or RingCentral mention clearly enough, ask the owner to "
+    "clarify instead of guessing.\n"
     "- The tool returns a recent-message window, not a pre-filtered time range. "
     "Infer any requested time range from the owner request and the returned "
     "timestamps.\n"
@@ -186,21 +193,51 @@ def _content_type_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 
-def _strip_rc_mentions(text: str, own_person_id: Optional[str]) -> str:
-    """Strip RC inline mentions from the start of ``text``.
+def _strip_rc_mentions(
+    text: str,
+    own_person_id: Optional[str],
+    *,
+    preserve_non_bot_mentions: bool = False,
+) -> str:
+    """Strip RC inline mentions from ``text``.
 
     RC group chats prefix bot-addressed messages with one or more
     ``![:Person](12345)`` tokens. The agent should see the clean text only.
-    When ``own_person_id`` is provided, the *first* matching prefix that
-    targets the bot is removed; any subsequent mentions are simplified to
-    their display form (the segment after the colon, stripped of markup) so
-    references to other users still read naturally.
+    Owner DM history requests may include RingCentral Team/Group/Person
+    mentions as the target; when ``preserve_non_bot_mentions`` is true, those
+    non-bot mentions are retained so the history tool can resolve them by ID.
     """
     if not text:
         return text
 
     stripped = text.lstrip()
     leading_ws = text[: len(text) - len(stripped)]
+
+    if preserve_non_bot_mentions:
+        # Owner DM history requests can use a Team/Group/Person mention as the
+        # target. Remove only explicit bot mentions and keep target mentions.
+        addressed = False
+        while True:
+            match = _RC_TYPED_MENTION_RE.match(stripped)
+            if not match:
+                break
+            if own_person_id and match.group("id") == str(own_person_id):
+                addressed = True
+                stripped = stripped[match.end():].lstrip()
+                continue
+            break
+
+        if own_person_id:
+            own_id = str(own_person_id)
+
+            def _drop_own_mention(match: re.Match[str]) -> str:
+                return "" if match.group("id") == own_id else match.group(0)
+
+            stripped = _RC_TYPED_MENTION_RE.sub(_drop_own_mention, stripped)
+
+        if addressed:
+            return stripped.strip()
+        return (leading_ws + stripped).rstrip() or text
 
     # Remove any leading mention prefix(es) — bot mention or otherwise.
     addressed = False
@@ -556,6 +593,8 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._processing_emoji_posts: Dict[str, str] = {}
         self._processing_emoji_edit_tasks: Dict[str, asyncio.Task] = {}
         self._processing_emoji_thread_ids: Dict[str, str] = {}
+        self._processing_thread_routes: Dict[str, Dict[str, Optional[str]]] = {}
+        self._processing_keys_by_chat: Dict[str, List[str]] = {}
 
         self._dedup = MessageDeduplicator()
         self._threads = ThreadParticipationTracker("ringcentral")
@@ -597,6 +636,85 @@ class RingCentralAdapter(BasePlatformAdapter):
         for ws in (self._ws, self._owner_ws):
             if ws is not None:
                 ws.mark_own_post(str(post_id))
+
+    def _remember_processing_route(
+        self,
+        key: str,
+        chat_id: str,
+        *,
+        parent_post_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        key = str(key or "").strip()
+        chat_id = str(chat_id or "").strip()
+        parent_post_id = str(parent_post_id or "").strip() or None
+        thread_id = str(thread_id or "").strip() or None
+        if not key or not chat_id or not (parent_post_id or thread_id):
+            return
+        self._processing_thread_routes[key] = {
+            "chat_id": chat_id,
+            "parent_post_id": parent_post_id,
+            "thread_id": thread_id,
+        }
+        keys = self._processing_keys_by_chat.setdefault(chat_id, [])
+        if key not in keys:
+            keys.append(key)
+
+    def _forget_processing_route(self, key: str, chat_id: str) -> None:
+        key = str(key or "").strip()
+        chat_id = str(chat_id or "").strip()
+        if key:
+            self._processing_thread_routes.pop(key, None)
+        if chat_id:
+            keys = self._processing_keys_by_chat.get(chat_id)
+            if keys:
+                self._processing_keys_by_chat[chat_id] = [
+                    item for item in keys if item != key
+                ]
+                if not self._processing_keys_by_chat[chat_id]:
+                    self._processing_keys_by_chat.pop(chat_id, None)
+
+    def _active_processing_thread_target(
+        self,
+        chat_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        chat_id = str(chat_id or "").strip()
+        keys = self._processing_keys_by_chat.get(chat_id)
+        if not keys:
+            return None, None
+        while keys:
+            key = keys[-1]
+            route = self._processing_thread_routes.get(key)
+            if route:
+                parent_post_id = str(route.get("parent_post_id") or "").strip()
+                thread_id = str(route.get("thread_id") or "").strip()
+                if parent_post_id or thread_id:
+                    return parent_post_id or None, thread_id or None
+            keys.pop()
+        self._processing_keys_by_chat.pop(chat_id, None)
+        return None, None
+
+    def _promote_processing_route_to_thread(
+        self,
+        chat_id: str,
+        thread_id: str,
+        *,
+        parent_post_id: Optional[str] = None,
+    ) -> None:
+        chat_id = str(chat_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        parent_post_id = str(parent_post_id or "").strip()
+        if not chat_id or not thread_id:
+            return
+        for key in reversed(self._processing_keys_by_chat.get(chat_id, [])):
+            route = self._processing_thread_routes.get(key)
+            if not route:
+                continue
+            if parent_post_id and route.get("parent_post_id") != parent_post_id:
+                continue
+            route["parent_post_id"] = None
+            route["thread_id"] = thread_id
+            return
 
     async def _client_send_post(
         self,
@@ -805,7 +923,7 @@ class RingCentralAdapter(BasePlatformAdapter):
 
         reply_to_id = str(reply_to or "").strip()
         if not reply_to_id:
-            return None, None
+            return self._active_processing_thread_target(chat_id)
 
         processing_thread_id = self._processing_emoji_thread_ids.get(
             f"{chat_id}:{reply_to_id}"
@@ -861,6 +979,11 @@ class RingCentralAdapter(BasePlatformAdapter):
             last_id = str(data["id"])
             returned_thread_id = str(data.get("threadId") or "").strip()
             if returned_thread_id:
+                self._promote_processing_route_to_thread(
+                    chat_id,
+                    returned_thread_id,
+                    parent_post_id=parent_post_id,
+                )
                 active_thread_id = returned_thread_id
                 parent_post_id = None
 
@@ -1110,8 +1233,6 @@ class RingCentralAdapter(BasePlatformAdapter):
             )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        if not self._processing_emoji_enabled:
-            return
         source = getattr(event, "source", None)
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
         reply_to = str(
@@ -1126,6 +1247,27 @@ class RingCentralAdapter(BasePlatformAdapter):
             or not key
             or key in self._processing_emoji_posts
         ):
+            return
+
+        source_thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        if source_thread_id:
+            parent_post_id, thread_id = self._thread_target_from_metadata({
+                "thread_id": source_thread_id,
+            })
+            self._remember_processing_route(
+                key,
+                chat_id,
+                parent_post_id=parent_post_id,
+                thread_id=thread_id,
+            )
+        else:
+            self._remember_processing_route(
+                key,
+                chat_id,
+                parent_post_id=reply_to,
+            )
+
+        if not self._processing_emoji_enabled:
             return
 
         result = await self.send(
@@ -1149,6 +1291,7 @@ class RingCentralAdapter(BasePlatformAdapter):
             thread_id = str(result.raw_response.get("thread_id") or "").strip()
             if thread_id:
                 self._processing_emoji_thread_ids[key] = thread_id
+                self._remember_processing_route(key, chat_id, thread_id=thread_id)
         self._processing_emoji_edit_tasks[key] = asyncio.create_task(
             self._edit_processing_emoji_after_delay(
                 key,
@@ -1163,12 +1306,14 @@ class RingCentralAdapter(BasePlatformAdapter):
         event: MessageEvent,
         outcome: ProcessingOutcome,
     ) -> None:
-        if not self._processing_emoji_enabled:
-            return
         source = getattr(event, "source", None)
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
         key = self._processing_emoji_key(event)
         if not chat_id or not key:
+            return
+
+        self._forget_processing_route(key, chat_id)
+        if not self._processing_emoji_enabled:
             return
 
         self._processing_emoji_thread_ids.pop(key, None)
@@ -2216,7 +2361,11 @@ class RingCentralAdapter(BasePlatformAdapter):
         addressed_explicit = bool(
             self._own_person_id and f"({self._own_person_id})" in raw_text
         )
-        text = _strip_rc_mentions(raw_text, self._own_person_id)
+        text = _strip_rc_mentions(
+            raw_text,
+            self._own_person_id,
+            preserve_non_bot_mentions=bool(chat_type == "dm" and bot_dm_chat),
+        )
 
         sender_profile = await self._resolve_sender_profile(creator_id, identity)
         sender_name = sender_profile["name"]
