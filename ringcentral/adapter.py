@@ -593,6 +593,8 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._processing_emoji_posts: Dict[str, str] = {}
         self._processing_emoji_edit_tasks: Dict[str, asyncio.Task] = {}
         self._processing_emoji_thread_ids: Dict[str, str] = {}
+        self._processing_thread_routes: Dict[str, Dict[str, Optional[str]]] = {}
+        self._processing_keys_by_chat: Dict[str, List[str]] = {}
 
         self._dedup = MessageDeduplicator()
         self._threads = ThreadParticipationTracker("ringcentral")
@@ -634,6 +636,85 @@ class RingCentralAdapter(BasePlatformAdapter):
         for ws in (self._ws, self._owner_ws):
             if ws is not None:
                 ws.mark_own_post(str(post_id))
+
+    def _remember_processing_route(
+        self,
+        key: str,
+        chat_id: str,
+        *,
+        parent_post_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        key = str(key or "").strip()
+        chat_id = str(chat_id or "").strip()
+        parent_post_id = str(parent_post_id or "").strip() or None
+        thread_id = str(thread_id or "").strip() or None
+        if not key or not chat_id or not (parent_post_id or thread_id):
+            return
+        self._processing_thread_routes[key] = {
+            "chat_id": chat_id,
+            "parent_post_id": parent_post_id,
+            "thread_id": thread_id,
+        }
+        keys = self._processing_keys_by_chat.setdefault(chat_id, [])
+        if key not in keys:
+            keys.append(key)
+
+    def _forget_processing_route(self, key: str, chat_id: str) -> None:
+        key = str(key or "").strip()
+        chat_id = str(chat_id or "").strip()
+        if key:
+            self._processing_thread_routes.pop(key, None)
+        if chat_id:
+            keys = self._processing_keys_by_chat.get(chat_id)
+            if keys:
+                self._processing_keys_by_chat[chat_id] = [
+                    item for item in keys if item != key
+                ]
+                if not self._processing_keys_by_chat[chat_id]:
+                    self._processing_keys_by_chat.pop(chat_id, None)
+
+    def _active_processing_thread_target(
+        self,
+        chat_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        chat_id = str(chat_id or "").strip()
+        keys = self._processing_keys_by_chat.get(chat_id)
+        if not keys:
+            return None, None
+        while keys:
+            key = keys[-1]
+            route = self._processing_thread_routes.get(key)
+            if route:
+                parent_post_id = str(route.get("parent_post_id") or "").strip()
+                thread_id = str(route.get("thread_id") or "").strip()
+                if parent_post_id or thread_id:
+                    return parent_post_id or None, thread_id or None
+            keys.pop()
+        self._processing_keys_by_chat.pop(chat_id, None)
+        return None, None
+
+    def _promote_processing_route_to_thread(
+        self,
+        chat_id: str,
+        thread_id: str,
+        *,
+        parent_post_id: Optional[str] = None,
+    ) -> None:
+        chat_id = str(chat_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        parent_post_id = str(parent_post_id or "").strip()
+        if not chat_id or not thread_id:
+            return
+        for key in reversed(self._processing_keys_by_chat.get(chat_id, [])):
+            route = self._processing_thread_routes.get(key)
+            if not route:
+                continue
+            if parent_post_id and route.get("parent_post_id") != parent_post_id:
+                continue
+            route["parent_post_id"] = None
+            route["thread_id"] = thread_id
+            return
 
     async def _client_send_post(
         self,
@@ -842,7 +923,7 @@ class RingCentralAdapter(BasePlatformAdapter):
 
         reply_to_id = str(reply_to or "").strip()
         if not reply_to_id:
-            return None, None
+            return self._active_processing_thread_target(chat_id)
 
         processing_thread_id = self._processing_emoji_thread_ids.get(
             f"{chat_id}:{reply_to_id}"
@@ -898,6 +979,11 @@ class RingCentralAdapter(BasePlatformAdapter):
             last_id = str(data["id"])
             returned_thread_id = str(data.get("threadId") or "").strip()
             if returned_thread_id:
+                self._promote_processing_route_to_thread(
+                    chat_id,
+                    returned_thread_id,
+                    parent_post_id=parent_post_id,
+                )
                 active_thread_id = returned_thread_id
                 parent_post_id = None
 
@@ -1147,8 +1233,6 @@ class RingCentralAdapter(BasePlatformAdapter):
             )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        if not self._processing_emoji_enabled:
-            return
         source = getattr(event, "source", None)
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
         reply_to = str(
@@ -1163,6 +1247,27 @@ class RingCentralAdapter(BasePlatformAdapter):
             or not key
             or key in self._processing_emoji_posts
         ):
+            return
+
+        source_thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        if source_thread_id:
+            parent_post_id, thread_id = self._thread_target_from_metadata({
+                "thread_id": source_thread_id,
+            })
+            self._remember_processing_route(
+                key,
+                chat_id,
+                parent_post_id=parent_post_id,
+                thread_id=thread_id,
+            )
+        else:
+            self._remember_processing_route(
+                key,
+                chat_id,
+                parent_post_id=reply_to,
+            )
+
+        if not self._processing_emoji_enabled:
             return
 
         result = await self.send(
@@ -1186,6 +1291,7 @@ class RingCentralAdapter(BasePlatformAdapter):
             thread_id = str(result.raw_response.get("thread_id") or "").strip()
             if thread_id:
                 self._processing_emoji_thread_ids[key] = thread_id
+                self._remember_processing_route(key, chat_id, thread_id=thread_id)
         self._processing_emoji_edit_tasks[key] = asyncio.create_task(
             self._edit_processing_emoji_after_delay(
                 key,
@@ -1200,12 +1306,14 @@ class RingCentralAdapter(BasePlatformAdapter):
         event: MessageEvent,
         outcome: ProcessingOutcome,
     ) -> None:
-        if not self._processing_emoji_enabled:
-            return
         source = getattr(event, "source", None)
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
         key = self._processing_emoji_key(event)
         if not chat_id or not key:
+            return
+
+        self._forget_processing_route(key, chat_id)
+        if not self._processing_emoji_enabled:
             return
 
         self._processing_emoji_thread_ids.pop(key, None)

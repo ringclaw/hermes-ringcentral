@@ -1068,6 +1068,7 @@ class TestProcessingEmoji:
         client = MagicMock()
         client.send_post = AsyncMock(side_effect=[
             {"id": "p-wait", "threadId": "t-1"},
+            {"id": "p-status", "threadId": "t-1"},
             {"id": "p-final", "threadId": "t-1"},
         ])
         client.update_post = AsyncMock(return_value={"id": "p-wait"})
@@ -1079,6 +1080,7 @@ class TestProcessingEmoji:
             await adapter.on_processing_start(event)
             assert adapter._processing_emoji_posts == {"g-1:p-parent": "p-wait"}
             assert adapter._processing_emoji_thread_ids == {"g-1:p-parent": "t-1"}
+            await adapter.send("g-1", "🗜️ Compacting context")
             await adapter.send("g-1", "final", reply_to="p-parent")
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -1088,13 +1090,20 @@ class TestProcessingEmoji:
         assert client.send_post.await_args_list[0].kwargs == {
             "parent_post_id": "p-parent"
         }
-        assert client.send_post.await_args_list[1].args == ("g-1", "final")
+        assert client.send_post.await_args_list[1].args == (
+            "g-1",
+            "🗜️ Compacting context",
+        )
         assert client.send_post.await_args_list[1].kwargs == {"thread_id": "t-1"}
+        assert client.send_post.await_args_list[2].args == ("g-1", "final")
+        assert client.send_post.await_args_list[2].kwargs == {"thread_id": "t-1"}
         client.delete_post.assert_awaited_once_with("g-1", "p-wait")
         client.update_post.assert_not_awaited()
         assert adapter._processing_emoji_posts == {}
         assert adapter._processing_emoji_edit_tasks == {}
         assert adapter._processing_emoji_thread_ids == {}
+        assert adapter._processing_thread_routes == {}
+        assert adapter._processing_keys_by_chat == {}
 
     def test_processing_start_posts_waiting_emoji_with_parent_post_id(self, monkeypatch):
         monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "true")
@@ -1161,6 +1170,29 @@ class TestProcessingEmoji:
         client.send_post.assert_not_awaited()
         assert adapter._processing_emoji_posts == {}
         assert adapter._processing_emoji_edit_tasks == {}
+
+    def test_unanchored_status_threads_while_processing_emoji_disabled(self, monkeypatch):
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "false")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-status", "threadId": "t-1"})
+        adapter._client = client
+        event = _make_message_event(adapter)
+
+        async def run():
+            await adapter.on_processing_start(event)
+            await adapter.send("g-1", "🗜️ Compacting context")
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        asyncio.run(run())
+
+        client.send_post.assert_awaited_once_with(
+            "g-1",
+            "🗜️ Compacting context",
+            parent_post_id="p-parent",
+        )
+        assert adapter._processing_thread_routes == {}
+        assert adapter._processing_keys_by_chat == {}
 
 
 # ---------------------------------------------------------------------------
