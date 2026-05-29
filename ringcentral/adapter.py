@@ -147,6 +147,13 @@ _RINGCENTRAL_OWNER_DM_TOOL_PROMPT = (
     f"- If the owner asks to summarize, search, inspect, or answer questions "
     f"about RingCentral chat history, call the {_RINGCENTRAL_HISTORY_TOOL_NAME} "
     "tool with the exact target person or chat.\n"
+    "- Resolve each new history request from the current owner message. Do not "
+    "answer a new chat-history request from previous tool results or prior "
+    "conversation context unless the owner explicitly asks to continue with the "
+    "same chat.\n"
+    "- If the current owner message does not identify a target chat, person, "
+    "email, chat ID, or RingCentral mention clearly enough, ask the owner to "
+    "clarify instead of guessing.\n"
     "- The tool returns a recent-message window, not a pre-filtered time range. "
     "Infer any requested time range from the owner request and the returned "
     "timestamps.\n"
@@ -186,21 +193,51 @@ def _content_type_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 
-def _strip_rc_mentions(text: str, own_person_id: Optional[str]) -> str:
-    """Strip RC inline mentions from the start of ``text``.
+def _strip_rc_mentions(
+    text: str,
+    own_person_id: Optional[str],
+    *,
+    preserve_non_bot_mentions: bool = False,
+) -> str:
+    """Strip RC inline mentions from ``text``.
 
     RC group chats prefix bot-addressed messages with one or more
     ``![:Person](12345)`` tokens. The agent should see the clean text only.
-    When ``own_person_id`` is provided, the *first* matching prefix that
-    targets the bot is removed; any subsequent mentions are simplified to
-    their display form (the segment after the colon, stripped of markup) so
-    references to other users still read naturally.
+    Owner DM history requests may include RingCentral Team/Group/Person
+    mentions as the target; when ``preserve_non_bot_mentions`` is true, those
+    non-bot mentions are retained so the history tool can resolve them by ID.
     """
     if not text:
         return text
 
     stripped = text.lstrip()
     leading_ws = text[: len(text) - len(stripped)]
+
+    if preserve_non_bot_mentions:
+        # Owner DM history requests can use a Team/Group/Person mention as the
+        # target. Remove only explicit bot mentions and keep target mentions.
+        addressed = False
+        while True:
+            match = _RC_TYPED_MENTION_RE.match(stripped)
+            if not match:
+                break
+            if own_person_id and match.group("id") == str(own_person_id):
+                addressed = True
+                stripped = stripped[match.end():].lstrip()
+                continue
+            break
+
+        if own_person_id:
+            own_id = str(own_person_id)
+
+            def _drop_own_mention(match: re.Match[str]) -> str:
+                return "" if match.group("id") == own_id else match.group(0)
+
+            stripped = _RC_TYPED_MENTION_RE.sub(_drop_own_mention, stripped)
+
+        if addressed:
+            return stripped.strip()
+        return (leading_ws + stripped).rstrip() or text
 
     # Remove any leading mention prefix(es) — bot mention or otherwise.
     addressed = False
@@ -2216,7 +2253,11 @@ class RingCentralAdapter(BasePlatformAdapter):
         addressed_explicit = bool(
             self._own_person_id and f"({self._own_person_id})" in raw_text
         )
-        text = _strip_rc_mentions(raw_text, self._own_person_id)
+        text = _strip_rc_mentions(
+            raw_text,
+            self._own_person_id,
+            preserve_non_bot_mentions=bool(chat_type == "dm" and bot_dm_chat),
+        )
 
         sender_profile = await self._resolve_sender_profile(creator_id, identity)
         sender_name = sender_profile["name"]
