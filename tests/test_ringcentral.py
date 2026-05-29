@@ -17,6 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from gateway.platforms.base import MessageEvent, ProcessingOutcome  # noqa: E402
 from ringcentral import (  # noqa: E402
     register,
 )
@@ -61,6 +62,29 @@ def _make_adapter(token: str = "test-token", extra: dict[str, Any] | None = None
 
     cfg = PlatformConfig(enabled=True, token=token, extra=extra or {})
     return RingCentralAdapter(cfg)
+
+
+def _make_message_event(
+    adapter: RingCentralAdapter,
+    *,
+    chat_id: str = "g-1",
+    message_id: str = "p-parent",
+    thread_id: str | None = None,
+) -> MessageEvent:
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_type="group",
+        user_id="alice@example.com",
+        user_name="Alice",
+        thread_id=thread_id,
+        message_id=message_id,
+    )
+    return MessageEvent(
+        text="hello",
+        source=source,
+        raw_message={"id": message_id},
+        message_id=message_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1028,109 @@ class TestAdapterSend:
         assert result.success is True
         owner.update_post.assert_awaited_once_with("g-1", "p-owner", "updated")
         bot.update_post.assert_not_awaited()
+
+
+class TestProcessingEmoji:
+    def test_processing_start_posts_waiting_emoji_in_root_thread(self, monkeypatch):
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "true")
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS", "3600")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(side_effect=[
+            {"id": "p-wait", "threadId": "t-1"},
+            {"id": "p-final", "threadId": "t-1"},
+        ])
+        client.update_post = AsyncMock(return_value={"id": "p-wait"})
+        client.delete_post = AsyncMock(return_value=True)
+        adapter._client = client
+        event = _make_message_event(adapter)
+
+        async def run():
+            await adapter.on_processing_start(event)
+            assert adapter._processing_emoji_posts == {"g-1:p-parent": "p-wait"}
+            assert adapter._processing_emoji_thread_ids == {"g-1:p-parent": "t-1"}
+            await adapter.send("g-1", "final", reply_to="p-parent")
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        asyncio.run(run())
+
+        assert client.send_post.await_args_list[0].args == ("g-1", "👀")
+        assert client.send_post.await_args_list[0].kwargs == {
+            "parent_post_id": "p-parent"
+        }
+        assert client.send_post.await_args_list[1].args == ("g-1", "final")
+        assert client.send_post.await_args_list[1].kwargs == {"thread_id": "t-1"}
+        client.delete_post.assert_awaited_once_with("g-1", "p-wait")
+        client.update_post.assert_not_awaited()
+        assert adapter._processing_emoji_posts == {}
+        assert adapter._processing_emoji_edit_tasks == {}
+        assert adapter._processing_emoji_thread_ids == {}
+
+    def test_processing_start_posts_waiting_emoji_with_parent_post_id(self, monkeypatch):
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "true")
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS", "3600")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-wait", "threadId": "t-1"})
+        client.update_post = AsyncMock(return_value={"id": "p-wait"})
+        client.delete_post = AsyncMock(return_value=True)
+        adapter._client = client
+        event = _make_message_event(adapter)
+
+        async def run():
+            await adapter.on_processing_start(event)
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        asyncio.run(run())
+
+        client.send_post.assert_awaited_once_with(
+            "g-1",
+            "👀",
+            parent_post_id="p-parent",
+        )
+        client.update_post.assert_not_awaited()
+        client.delete_post.assert_awaited_once_with("g-1", "p-wait")
+        assert adapter._processing_emoji_posts == {}
+        assert adapter._processing_emoji_edit_tasks == {}
+
+    def test_processing_emoji_edits_after_delay_in_existing_thread(self, monkeypatch):
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "true")
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS", "0")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-wait", "threadId": "t-1"})
+        client.update_post = AsyncMock(return_value={"id": "p-wait"})
+        client.delete_post = AsyncMock(return_value=True)
+        adapter._client = client
+        event = _make_message_event(adapter, thread_id="t-1")
+
+        async def run():
+            await adapter.on_processing_start(event)
+            await asyncio.wait_for(
+                adapter._processing_emoji_edit_tasks["g-1:p-parent"],
+                timeout=1,
+            )
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        asyncio.run(run())
+
+        client.send_post.assert_awaited_once_with("g-1", "👀", thread_id="t-1")
+        client.update_post.assert_awaited_once_with("g-1", "p-wait", "⏳")
+        client.delete_post.assert_awaited_once_with("g-1", "p-wait")
+
+    def test_processing_emoji_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("RC_PROCESSING_EMOJI_ENABLED", "false")
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_post = AsyncMock(return_value={"id": "p-wait"})
+        adapter._client = client
+        event = _make_message_event(adapter)
+
+        asyncio.run(adapter.on_processing_start(event))
+
+        client.send_post.assert_not_awaited()
+        assert adapter._processing_emoji_posts == {}
+        assert adapter._processing_emoji_edit_tasks == {}
 
 
 # ---------------------------------------------------------------------------
