@@ -358,6 +358,17 @@ class TestAutoResumeGuard:
 
         super_hm.assert_not_awaited()
         store.clear_resume_pending.assert_called_once()
+        # Verify the key passed to clear_resume_pending matches what
+        # build_session_key produces for the same source — a drift in
+        # key construction would silently break the guard.
+        from gateway.session import build_session_key
+
+        expected_key = build_session_key(
+            event.source,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        store.clear_resume_pending.assert_called_once_with(expected_key)
 
     def test_dm_empty_internal_is_forwarded(self):
         adapter = _make_adapter()

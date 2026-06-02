@@ -644,8 +644,12 @@ class RingCentralAdapter(BasePlatformAdapter):
                 thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
             )
             store.clear_resume_pending(session_key)
-        except Exception:
-            logger.exception("RingCentral: failed to clear resume_pending")
+        except (ImportError, AttributeError, KeyError, TypeError):
+            logger.warning(
+                "RingCentral: failed to clear resume_pending for %s",
+                locals().get("session_key", "?"),
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
