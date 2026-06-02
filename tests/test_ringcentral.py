@@ -2274,6 +2274,106 @@ class TestRingCentralHistoryTool:
 
 
 # ---------------------------------------------------------------------------
+# Auto-resume guard (issue #9)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoResumeGuard:
+    """Restart auto-resume must not blast unsolicited replies into groups."""
+
+    def _make_event(self, adapter, *, chat_type, text="", internal=True):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        source = adapter.build_source(
+            chat_id="g-99",
+            chat_type=chat_type,
+            user_id="u-1",
+            user_name="Alice",
+        )
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=internal,
+        )
+
+    def test_group_empty_internal_is_dropped_and_cleared(self):
+        adapter = _make_adapter()
+        adapter.set_message_handler(AsyncMock())
+        store = MagicMock()
+        adapter._session_store = store
+        event = self._make_event(adapter, chat_type="group")
+
+        with patch(
+            "gateway.platforms.base.BasePlatformAdapter.handle_message",
+            new=AsyncMock(),
+        ) as super_hm:
+            asyncio.run(adapter.handle_message(event))
+
+        super_hm.assert_not_awaited()
+        store.clear_resume_pending.assert_called_once()
+        # Verify the key passed to clear_resume_pending matches what
+        # build_session_key produces for the same source — a drift in
+        # key construction would silently break the guard.
+        from gateway.session import build_session_key
+
+        expected_key = build_session_key(
+            event.source,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        store.clear_resume_pending.assert_called_once_with(expected_key)
+
+    def test_dm_empty_internal_is_forwarded(self):
+        adapter = _make_adapter()
+        adapter._session_store = MagicMock()
+        event = self._make_event(adapter, chat_type="dm")
+
+        with patch(
+            "gateway.platforms.base.BasePlatformAdapter.handle_message",
+            new=AsyncMock(),
+        ) as super_hm:
+            asyncio.run(adapter.handle_message(event))
+
+        super_hm.assert_awaited_once()
+        adapter._session_store.clear_resume_pending.assert_not_called()
+
+    def test_normal_group_message_is_forwarded(self):
+        adapter = _make_adapter()
+        adapter._session_store = MagicMock()
+        event = self._make_event(
+            adapter, chat_type="group", text="hello bot", internal=False
+        )
+
+        with patch(
+            "gateway.platforms.base.BasePlatformAdapter.handle_message",
+            new=AsyncMock(),
+        ) as super_hm:
+            asyncio.run(adapter.handle_message(event))
+
+        super_hm.assert_awaited_once()
+        adapter._session_store.clear_resume_pending.assert_not_called()
+
+    def test_internal_with_text_is_forwarded(self):
+        # Only empty-text internal events are auto-resume; non-empty internal
+        # events (continuations, kickoffs) must still pass through.
+        adapter = _make_adapter()
+        adapter._session_store = MagicMock()
+        event = self._make_event(
+            adapter, chat_type="group", text="continue please", internal=True
+        )
+
+        with patch(
+            "gateway.platforms.base.BasePlatformAdapter.handle_message",
+            new=AsyncMock(),
+        ) as super_hm:
+            asyncio.run(adapter.handle_message(event))
+
+        super_hm.assert_awaited_once()
+        adapter._session_store.clear_resume_pending.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _is_connected
 # ---------------------------------------------------------------------------
 
