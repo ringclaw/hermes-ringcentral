@@ -591,6 +591,62 @@ class RingCentralAdapter(BasePlatformAdapter):
             return None
         return local_path, mime
 
+    # ── Auto-resume guard ─────────────────────────────────────────────────
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Drop unsolicited restart auto-resume events in group chats.
+
+        On startup the gateway's restart watchdog re-drives every
+        ``resume_pending`` session by synthesizing an empty-text *internal*
+        ``MessageEvent`` and calling ``adapter.handle_message`` (see core
+        ``gateway/run.py:_schedule_resume_pending_sessions``). Internal events
+        bypass authorization in the core pipeline, so a group session that
+        merely happened to be active near a restart would make the agent
+        hallucinate and post an unsolicited reply into the group (issue #9).
+
+        RingCentral group output is highly visible, so we suppress these
+        synthetic resumes and clear ``resume_pending`` to stop the watchdog
+        re-firing. DMs still auto-resume normally (1:1, no public blast).
+        """
+        source = getattr(event, "source", None)
+        if (
+            bool(getattr(event, "internal", False))
+            and not (event.text or "").strip()
+            and source is not None
+            and getattr(source, "chat_type", None) not in (None, "dm")
+        ):
+            logger.warning(
+                "RingCentral: suppressing unsolicited auto-resume for group "
+                "chat %s; clearing resume_pending",
+                getattr(source, "chat_id", "?"),
+            )
+            self._clear_resume_pending_for(source)
+            return
+        await super().handle_message(event)
+
+    def _clear_resume_pending_for(self, source: Any) -> None:
+        """Best-effort clear of ``resume_pending`` for ``source``'s session.
+
+        Rebuilds the session key the same way the core pipeline does (see
+        ``gateway.session.build_session_key``) so the cleared key matches the
+        entry the watchdog would otherwise keep re-driving.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return
+        try:
+            from gateway.session import build_session_key
+
+            extra = getattr(self.config, "extra", {}) or {}
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            )
+            store.clear_resume_pending(session_key)
+        except Exception:
+            logger.exception("RingCentral: failed to clear resume_pending")
+
 
 # ---------------------------------------------------------------------------
 # Env-driven auto-configuration
