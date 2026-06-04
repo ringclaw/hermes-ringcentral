@@ -41,6 +41,8 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -147,8 +149,16 @@ _RINGCENTRAL_CREATE_EVENT_TOOL_NAME = "ringcentral_create_calendar_event"
 _RINGCENTRAL_GET_EVENT_TOOL_NAME = "ringcentral_get_calendar_event"
 _RINGCENTRAL_UPDATE_EVENT_TOOL_NAME = "ringcentral_update_calendar_event"
 _RINGCENTRAL_DELETE_EVENT_TOOL_NAME = "ringcentral_delete_calendar_event"
+_RINGCENTRAL_CONFIRM_ARTIFACT_TOOL_NAME = "ringcentral_confirm_artifact_action"
 
 _EVENT_WRITE_PROPERTIES = {
+    "chat_id": {
+        "type": "string",
+        "description": (
+            "Optional target chat ID. Defaults to the current RingCentral session chat; "
+            "non-Home targets require Home DM confirmation."
+        ),
+    },
     "title": {"type": "string", "description": "Calendar event title."},
     "start_time": {
         "type": "string",
@@ -165,7 +175,7 @@ _EVENT_WRITE_PROPERTIES = {
 
 _RINGCENTRAL_LIST_EVENTS_SCHEMA = {
     "name": _RINGCENTRAL_LIST_EVENTS_TOOL_NAME,
-    "description": "List RingCentral calendar events in the current group/team chat. Owner credentials are required.",
+    "description": "List RingCentral calendar events in the current RingCentral session chat. Owner credentials are required.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -181,7 +191,7 @@ _RINGCENTRAL_LIST_EVENTS_SCHEMA = {
 
 _RINGCENTRAL_CREATE_EVENT_SCHEMA = {
     "name": _RINGCENTRAL_CREATE_EVENT_TOOL_NAME,
-    "description": "Create a RingCentral calendar event in the current group/team chat. Owner credentials are required.",
+    "description": "Create a RingCentral calendar event. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": _EVENT_WRITE_PROPERTIES,
@@ -203,7 +213,7 @@ _RINGCENTRAL_GET_EVENT_SCHEMA = {
 
 _RINGCENTRAL_UPDATE_EVENT_SCHEMA = {
     "name": _RINGCENTRAL_UPDATE_EVENT_TOOL_NAME,
-    "description": "Update a RingCentral calendar event by event ID. Title, start_time, and end_time are required.",
+    "description": "Update a RingCentral calendar event by event ID. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -216,7 +226,7 @@ _RINGCENTRAL_UPDATE_EVENT_SCHEMA = {
 
 _RINGCENTRAL_DELETE_EVENT_SCHEMA = {
     "name": _RINGCENTRAL_DELETE_EVENT_TOOL_NAME,
-    "description": "Delete a RingCentral calendar event by event ID.",
+    "description": "Delete a RingCentral calendar event by event ID. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -238,6 +248,8 @@ _RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
 _RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
 _NOTE_ID_DESCRIPTION = "RingCentral note ID."
 _NOTE_ID_REQUIRED_ERROR = "note_id is required."
+_ARTIFACT_CONFIRMATION_TTL_SECONDS = 120
+_PENDING_ARTIFACT_ACTIONS: Dict[str, Dict[str, Any]] = {}
 _SESSION_USER_ID_MISSING_ERROR = "RingCentral session user_id is missing."
 _OWNER_CREDENTIALS_MISSING_ERROR = (
     "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
@@ -310,7 +322,7 @@ _RINGCENTRAL_DELETE_ADAPTIVE_CARD_SCHEMA = {
 
 _RINGCENTRAL_LIST_NOTES_SCHEMA = {
     "name": _RINGCENTRAL_LIST_NOTES_TOOL_NAME,
-    "description": "List RingCentral notes in the current chat. Owner credentials are required.",
+    "description": "List RingCentral notes in the current RingCentral session chat. Owner credentials are required.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -325,13 +337,20 @@ _RINGCENTRAL_LIST_NOTES_SCHEMA = {
 }
 
 _NOTE_WRITE_PROPERTIES = {
+    "chat_id": {
+        "type": "string",
+        "description": (
+            "Optional target chat ID. Defaults to the current RingCentral session chat; "
+            "non-Home targets require Home DM confirmation."
+        ),
+    },
     "title": {"type": "string", "description": "Note title."},
     "body": {"type": "string", "description": "Note HTML body."},
 }
 
 _RINGCENTRAL_CREATE_NOTE_SCHEMA = {
     "name": _RINGCENTRAL_CREATE_NOTE_TOOL_NAME,
-    "description": "Create a draft RingCentral note in the current chat. Set publish=true to publish it immediately.",
+    "description": "Create a draft RingCentral note. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -359,7 +378,7 @@ _RINGCENTRAL_GET_NOTE_SCHEMA = {
 
 _RINGCENTRAL_UPDATE_NOTE_SCHEMA = {
     "name": _RINGCENTRAL_UPDATE_NOTE_TOOL_NAME,
-    "description": "Update a RingCentral note title and/or body by note ID.",
+    "description": "Update a RingCentral note title and/or body by note ID. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -372,7 +391,7 @@ _RINGCENTRAL_UPDATE_NOTE_SCHEMA = {
 
 _RINGCENTRAL_DELETE_NOTE_SCHEMA = {
     "name": _RINGCENTRAL_DELETE_NOTE_TOOL_NAME,
-    "description": "Delete a RingCentral note by note ID.",
+    "description": "Delete a RingCentral note by note ID. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -384,13 +403,28 @@ _RINGCENTRAL_DELETE_NOTE_SCHEMA = {
 
 _RINGCENTRAL_PUBLISH_NOTE_SCHEMA = {
     "name": _RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME,
-    "description": "Publish a draft RingCentral note by note ID.",
+    "description": "Publish a draft RingCentral note by note ID. Non-Home chat writes require Home DM confirmation.",
     "parameters": {
         "type": "object",
         "properties": {
             "note_id": {"type": "string", "description": _NOTE_ID_DESCRIPTION},
         },
         "required": ["note_id"],
+    },
+}
+
+_RINGCENTRAL_CONFIRM_ARTIFACT_SCHEMA = {
+    "name": _RINGCENTRAL_CONFIRM_ARTIFACT_TOOL_NAME,
+    "description": "Confirm a pending RingCentral owner artifact write from the configured Home DM.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "confirmation_id": {
+                "type": "string",
+                "description": "Pending confirmation ID returned by an owner artifact write tool.",
+            },
+        },
+        "required": ["confirmation_id"],
     },
 }
 
@@ -2997,6 +3031,188 @@ async def _owner_chat_client_for(
     return client, session_chat_id, None
 
 
+def _configured_home_channel() -> str:
+    return os.getenv("RC_HOME_CHANNEL", "").strip()
+
+
+def _resolve_artifact_target_chat(args: Dict[str, Any], session_chat_id: str) -> str:
+    return str(
+        args.get("chat_id")
+        or args.get("chatId")
+        or args.get("target_chat_id")
+        or session_chat_id
+        or ""
+    ).strip()
+
+
+def _cleanup_pending_artifact_actions() -> None:
+    now = time.time()
+    expired = [
+        confirmation_id
+        for confirmation_id, pending in _PENDING_ARTIFACT_ACTIONS.items()
+        if float(pending.get("expires_at") or 0) <= now
+    ]
+    for confirmation_id in expired:
+        _PENDING_ARTIFACT_ACTIONS.pop(confirmation_id, None)
+
+
+def _store_pending_artifact_action(action: Dict[str, Any]) -> str:
+    _cleanup_pending_artifact_actions()
+    confirmation_id = secrets.token_hex(16)
+    _PENDING_ARTIFACT_ACTIONS[confirmation_id] = {
+        **action,
+        "expires_at": time.time() + _ARTIFACT_CONFIRMATION_TTL_SECONDS,
+    }
+    return confirmation_id
+
+
+def _artifact_confirmation_payload(
+    *,
+    action_type: str,
+    target_chat_id: str,
+    summary: str,
+    action: Dict[str, Any],
+) -> str:
+    confirmation_id = _store_pending_artifact_action({
+        **action,
+        "type": action_type,
+        "target_chat_id": target_chat_id,
+        "summary": summary,
+    })
+    return _ringcentral_tool_json({
+        "success": False,
+        "requires_confirmation": True,
+        "requiresConfirmation": True,
+        "confirmation_id": confirmation_id,
+        "target_chat_id": target_chat_id,
+        "summary": summary,
+        "instruction": (
+            "Call ringcentral_confirm_artifact_action from the configured "
+            "RingCentral Home DM to execute this owner-backed write."
+        ),
+    })
+
+
+async def _owner_write_client_or_confirmation(
+    args: Dict[str, Any],
+    *,
+    tool_label: str,
+    owner_error: str,
+    action_type: str,
+    summary: str,
+    action: Dict[str, Any],
+) -> tuple[Optional[RingCentralClient], str, Optional[str]]:
+    client, session_chat_id, error = await _owner_chat_client_for(tool_label, owner_error)
+    if error or client is None:
+        return None, "", _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+
+    target_chat_id = _resolve_artifact_target_chat(args, session_chat_id)
+    if not target_chat_id:
+        await client.close()
+        return None, "", _ringcentral_tool_error("RingCentral target chat_id is missing.")
+
+    home_channel = _configured_home_channel()
+    if not home_channel:
+        await client.close()
+        return None, "", _ringcentral_tool_error(
+            "RC_HOME_CHANNEL must be set before owner-backed artifact writes."
+        )
+
+    if session_chat_id != home_channel and target_chat_id != session_chat_id:
+        await client.close()
+        return None, "", _ringcentral_tool_error(
+            "RingCentral owner artifact writes can only target the current chat, "
+            "or be confirmed from the configured Home DM."
+        )
+
+    if target_chat_id != home_channel:
+        await client.close()
+        return None, "", _artifact_confirmation_payload(
+            action_type=action_type,
+            target_chat_id=target_chat_id,
+            summary=summary,
+            action=action,
+        )
+
+    return client, target_chat_id, None
+
+
+async def _execute_pending_artifact_action(
+    client: RingCentralClient,
+    action: Dict[str, Any],
+) -> Dict[str, Any]:
+    action_type = str(action.get("type") or "")
+    target_chat_id = str(action.get("target_chat_id") or "")
+    if action_type == "create_event":
+        event = await client.create_event(target_chat_id, dict(action.get("payload") or {}))
+        return {"success": bool(event), "event_id": str((event or {}).get("id") or ""), "event": event}
+    if action_type == "update_event":
+        event = await client.update_event(str(action.get("event_id") or ""), dict(action.get("payload") or {}))
+        return {"success": bool(event), "event_id": str((event or {}).get("id") or ""), "event": event}
+    if action_type == "delete_event":
+        event_id = str(action.get("event_id") or "")
+        deleted = await client.delete_event(event_id)
+        return {"success": bool(deleted), "event_id": event_id}
+    if action_type == "create_note":
+        note = await client.create_note(target_chat_id, dict(action.get("payload") or {}))
+        published = False
+        if note and bool(action.get("publish")):
+            published = await client.publish_note(str(note.get("id") or ""))
+        return {
+            "success": bool(note),
+            "note_id": str((note or {}).get("id") or ""),
+            "published": published,
+            "note": _note_summary(note or {}),
+        }
+    if action_type == "update_note":
+        note = await client.update_note(str(action.get("note_id") or ""), dict(action.get("payload") or {}))
+        return {"success": bool(note), "note_id": str((note or {}).get("id") or ""), "note": _note_summary(note or {})}
+    if action_type == "delete_note":
+        note_id = str(action.get("note_id") or "")
+        deleted = await client.delete_note(note_id)
+        return {"success": bool(deleted), "deleted": bool(deleted)}
+    if action_type == "publish_note":
+        note_id = str(action.get("note_id") or "")
+        published = await client.publish_note(note_id)
+        return {"success": bool(published), "published": bool(published)}
+    return {"success": False, "error": "Unknown RingCentral artifact confirmation action."}
+
+
+async def _ringcentral_confirm_artifact_action(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    confirmation_id = str(args.get("confirmation_id") or args.get("id") or "").strip()
+    if not confirmation_id:
+        return _ringcentral_tool_error("confirmation_id is required.")
+
+    client, session_chat_id, error = await _owner_chat_client_for(
+        "artifact confirmation",
+        "Only the configured RingCentral owner can confirm artifact writes.",
+    )
+    if error or client is None:
+        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+
+    home_channel = _configured_home_channel()
+    try:
+        if not home_channel:
+            return _ringcentral_tool_error("RC_HOME_CHANNEL must be set before confirming artifact writes.")
+        if session_chat_id != home_channel:
+            return _ringcentral_tool_error(
+                "RingCentral artifact confirmations must be sent from the configured Home DM."
+            )
+
+        _cleanup_pending_artifact_actions()
+        pending = _PENDING_ARTIFACT_ACTIONS.pop(confirmation_id, None)
+        if not pending:
+            return _ringcentral_tool_error("Invalid or expired artifact confirmation.")
+
+        result = await _execute_pending_artifact_action(client, pending)
+        result["confirmed"] = True
+        result["summary"] = str(pending.get("summary") or "")
+        return _ringcentral_tool_json(result)
+    finally:
+        await client.close()
+
+
 async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Optional[str]]:
     return await _owner_chat_client_for(
         "note",
@@ -3081,9 +3297,17 @@ async def _ringcentral_create_calendar_event(args: Dict[str, Any], **_: Any) -> 
     payload = _event_write_payload(args)
     if not _event_write_payload_complete(payload):
         return _ringcentral_tool_error("title, start_time, and end_time are required.")
-    client, chat_id, error = await _owner_current_chat_client()
-    if error or client is None:
-        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    client, chat_id, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="calendar",
+        owner_error="Only the configured RingCentral owner can manage calendar events.",
+        action_type="create_event",
+        summary=f"Create calendar event: {payload.get('title')}",
+        action={"payload": payload},
+    )
+    if response:
+        return response
+    assert client is not None
     try:
         event = await client.create_event(chat_id, payload)
         if not isinstance(event, dict) or not event.get("id"):
@@ -3122,9 +3346,17 @@ async def _ringcentral_update_calendar_event(args: Dict[str, Any], **_: Any) -> 
     payload = _event_write_payload(args)
     if not _event_write_payload_complete(payload):
         return _ringcentral_tool_error("title, start_time, and end_time are required.")
-    client, _, error = await _owner_current_chat_client()
-    if error or client is None:
-        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    client, _, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="calendar",
+        owner_error="Only the configured RingCentral owner can manage calendar events.",
+        action_type="update_event",
+        summary=f"Update calendar event: {event_id}",
+        action={"event_id": event_id, "payload": payload},
+    )
+    if response:
+        return response
+    assert client is not None
     try:
         event = await client.update_event(event_id, payload)
         if not isinstance(event, dict) or not event.get("id"):
@@ -3143,9 +3375,17 @@ async def _ringcentral_delete_calendar_event(args: Dict[str, Any], **_: Any) -> 
     event_id = _event_id_from_args(args)
     if not event_id:
         return _ringcentral_tool_error("event_id is required.")
-    client, _, error = await _owner_current_chat_client()
-    if error or client is None:
-        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    client, _, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="calendar",
+        owner_error="Only the configured RingCentral owner can manage calendar events.",
+        action_type="delete_event",
+        summary=f"Delete calendar event: {event_id}",
+        action={"event_id": event_id},
+    )
+    if response:
+        return response
+    assert client is not None
     try:
         deleted = await client.delete_event(event_id)
         return _ringcentral_tool_json({"success": bool(deleted), "event_id": event_id})
@@ -3268,16 +3508,25 @@ async def _ringcentral_create_note(args: Dict[str, Any], **_: Any) -> str:
     title = str(args.get("title") or "").strip()
     if not title:
         return _ringcentral_tool_error("title is required.")
-    client, chat_id, error = await _owner_note_client()
-    if error:
-        return _ringcentral_tool_error(error)
+    payload = _note_write_payload(args)
+    publish = bool(args.get("publish"))
+    client, chat_id, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="note",
+        owner_error="Only the configured RingCentral owner can manage notes.",
+        action_type="create_note",
+        summary=f"Create note: {title}",
+        action={"payload": payload, "publish": publish},
+    )
+    if response:
+        return response
     assert client is not None
     try:
-        note = await client.create_note(chat_id, _note_write_payload(args))
+        note = await client.create_note(chat_id, payload)
         if not isinstance(note, dict) or not note.get("id"):
             return _ringcentral_tool_error("RingCentral note create failed.")
         published = False
-        if bool(args.get("publish")):
+        if publish:
             published = await client.publish_note(str(note.get("id")))
         return _ringcentral_tool_json({
             "success": True,
@@ -3318,9 +3567,16 @@ async def _ringcentral_update_note(args: Dict[str, Any], **_: Any) -> str:
     updates = _note_write_payload(args)
     if not updates:
         return _ringcentral_tool_error("title or body is required.")
-    client, _, error = await _owner_note_client()
-    if error:
-        return _ringcentral_tool_error(error)
+    client, _, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="note",
+        owner_error="Only the configured RingCentral owner can manage notes.",
+        action_type="update_note",
+        summary=f"Update note: {note_id}",
+        action={"note_id": note_id, "payload": updates},
+    )
+    if response:
+        return response
     assert client is not None
     try:
         note = await client.update_note(note_id, updates)
@@ -3340,9 +3596,16 @@ async def _ringcentral_delete_note(args: Dict[str, Any], **_: Any) -> str:
     note_id = _note_id_from_args(args)
     if not note_id:
         return _ringcentral_tool_error(_NOTE_ID_REQUIRED_ERROR)
-    client, _, error = await _owner_note_client()
-    if error:
-        return _ringcentral_tool_error(error)
+    client, _, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="note",
+        owner_error="Only the configured RingCentral owner can manage notes.",
+        action_type="delete_note",
+        summary=f"Delete note: {note_id}",
+        action={"note_id": note_id},
+    )
+    if response:
+        return response
     assert client is not None
     try:
         deleted = await client.delete_note(note_id)
@@ -3356,9 +3619,16 @@ async def _ringcentral_publish_note(args: Dict[str, Any], **_: Any) -> str:
     note_id = _note_id_from_args(args)
     if not note_id:
         return _ringcentral_tool_error(_NOTE_ID_REQUIRED_ERROR)
-    client, _, error = await _owner_note_client()
-    if error:
-        return _ringcentral_tool_error(error)
+    client, _, response = await _owner_write_client_or_confirmation(
+        args,
+        tool_label="note",
+        owner_error="Only the configured RingCentral owner can manage notes.",
+        action_type="publish_note",
+        summary=f"Publish note: {note_id}",
+        action={"note_id": note_id},
+    )
+    if response:
+        return response
     assert client is not None
     try:
         published = await client.publish_note(note_id)
@@ -3786,6 +4056,15 @@ def register(ctx) -> None:
         check_fn=_ringcentral_history_tool_available,
         is_async=True,
         emoji="📜",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_CONFIRM_ARTIFACT_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_CONFIRM_ARTIFACT_SCHEMA,
+        handler=_ringcentral_confirm_artifact_action,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="✅",
     )
     ctx.register_tool(
         name=_RINGCENTRAL_LIST_EVENTS_TOOL_NAME,
