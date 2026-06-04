@@ -18,6 +18,10 @@ Endpoints covered:
 * ``POST   /team-messaging/v1/files``                         — upload file
 * ``GET    /restapi/v1.0/account/~/extension/~``              — own extension
 * ``POST   /team-messaging/v1/conversations``                 — create/find DM
+* ``POST   /team-messaging/v1/chats/{chatID}/adaptive-cards`` — create Adaptive Card
+* ``GET    /team-messaging/v1/adaptive-cards/{cardID}``       — read Adaptive Card
+* ``PUT    /team-messaging/v1/adaptive-cards/{cardID}``       — update Adaptive Card
+* ``DELETE /team-messaging/v1/adaptive-cards/{cardID}``       — delete Adaptive Card
 * ``POST   /restapi/oauth/wstoken``                            — WebSocket token
 
 All methods return either the parsed JSON dict on success or ``None`` on
@@ -450,6 +454,62 @@ class RingCentralClient:
         if not data:
             return None
         return data.get("records", []) if isinstance(data, dict) else None
+
+    # ------------------------------------------------------------------
+    # Adaptive Cards
+    # ------------------------------------------------------------------
+
+    async def create_adaptive_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create an Adaptive Card in ``chat_id``."""
+        if not chat_id:
+            return None
+        payload = dict(card or {})
+        payload["type"] = "AdaptiveCard"
+        return await self._request(
+            "POST",
+            f"/team-messaging/v1/chats/{quote(chat_id, safe='')}/adaptive-cards",
+            json_body=payload,
+        )
+
+    async def get_adaptive_card(self, card_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one Adaptive Card by ID."""
+        if not card_id:
+            return None
+        return await self._request(
+            "GET",
+            f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
+        )
+
+    async def update_adaptive_card(
+        self,
+        card_id: str,
+        card: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Replace an existing Adaptive Card."""
+        if not card_id:
+            return None
+        payload = dict(card or {})
+        payload["type"] = "AdaptiveCard"
+        return await self._request(
+            "PUT",
+            f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
+            json_body=payload,
+        )
+
+    async def delete_adaptive_card(self, card_id: str) -> bool:
+        """Delete an Adaptive Card. Returns True on success."""
+        if not card_id:
+            return False
+        result = await self._request(
+            "DELETE",
+            f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
+            expect_json=False,
+        )
+        return result is not None
 
     # ------------------------------------------------------------------
     # Persons + own identity

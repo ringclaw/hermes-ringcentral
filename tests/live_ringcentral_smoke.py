@@ -51,6 +51,7 @@ async def test_ringcentral_live_smoke() -> None:
     owner_client: Any = None
     created_bot_post_ids: List[str] = []
     created_owner_post_ids: List[str] = []
+    created_bot_adaptive_card_ids: List[str] = []
     ringcentral_logger = logging.getLogger("ringcentral")
     previous_log_level = ringcentral_logger.level
     ringcentral_logger.setLevel(logging.CRITICAL)
@@ -117,6 +118,11 @@ async def test_ringcentral_live_smoke() -> None:
             created_bot_post_ids=created_bot_post_ids,
             created_owner_post_ids=created_owner_post_ids,
         )
+        await run_adaptive_card_scenario(
+            env=env,
+            bot_client=bot_client,
+            created_bot_adaptive_card_ids=created_bot_adaptive_card_ids,
+        )
     except Exception as exc:  # noqa: BLE001
         summary.fail(exc)
         raise
@@ -130,6 +136,11 @@ async def test_ringcentral_live_smoke() -> None:
                     owner_client=owner_client,
                     bot_post_ids=created_bot_post_ids,
                     owner_post_ids=created_owner_post_ids,
+                )
+                await cleanup_adaptive_cards(
+                    cleanup=env.cleanup,
+                    bot_client=bot_client,
+                    adaptive_card_ids=created_bot_adaptive_card_ids,
                 )
             if bot_client:
                 await bot_client.close()
@@ -488,6 +499,43 @@ async def run_threaded_reply_scenario(
     log_safe("owner_read_thread_reply", owner_read_found=True, thread_metadata=True)
 
 
+async def run_adaptive_card_scenario(
+    *,
+    env: LiveEnv,
+    bot_client: RingCentralClient,
+    created_bot_adaptive_card_ids: List[str],
+) -> None:
+    initial_text = build_unique_text("adaptive-card")
+    updated_text = build_unique_text("adaptive-card-updated")
+
+    created = await live_step(
+        "adaptive_card_create",
+        lambda: bot_client.create_adaptive_card(env.chat_id, build_adaptive_card(initial_text)),
+    )
+    assert_live(isinstance(created, dict) and created.get("id"), "adaptive_card_create", bot_client)
+    card_id = str(created["id"])
+    created_bot_adaptive_card_ids.append(card_id)
+    log_safe("adaptive_card_create", created=True)
+
+    read = await live_step(
+        "adaptive_card_get",
+        lambda: bot_client.get_adaptive_card(card_id),
+    )
+    assert_live(isinstance(read, dict) and str(read.get("id")) == card_id, "adaptive_card_get", bot_client)
+    log_safe("adaptive_card_get", found=True)
+
+    updated = await live_step(
+        "adaptive_card_update",
+        lambda: bot_client.update_adaptive_card(card_id, build_adaptive_card(updated_text)),
+    )
+    assert_live(
+        isinstance(updated, dict) and str(updated.get("id")) == card_id,
+        "adaptive_card_update",
+        bot_client,
+    )
+    log_safe("adaptive_card_update", updated=True)
+
+
 async def get_chat_metadata(
     owner_client: RingCentralClient,
     bot_client: RingCentralClient,
@@ -656,6 +704,25 @@ async def cleanup_posts(
     )
 
 
+async def cleanup_adaptive_cards(
+    *,
+    cleanup: bool,
+    bot_client: RingCentralClient,
+    adaptive_card_ids: List[str],
+) -> None:
+    if not cleanup:
+        log_safe("adaptive_card_cleanup", enabled=False)
+        return
+
+    cleanup_adaptive_cards = True
+    for card_id in reversed(adaptive_card_ids):
+        try:
+            cleanup_adaptive_cards = bool(await bot_client.delete_adaptive_card(card_id)) and cleanup_adaptive_cards
+        except Exception:  # noqa: BLE001
+            cleanup_adaptive_cards = False
+    log_safe("adaptive_card_cleanup", cleanup_adaptive_cards=cleanup_adaptive_cards)
+
+
 def build_unique_text(label: str) -> str:
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
@@ -671,6 +738,15 @@ def build_unique_text(label: str) -> str:
         )
         if part
     )
+
+
+def build_adaptive_card(text: str) -> Dict[str, Any]:
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.3",
+        "body": [{"type": "TextBlock", "text": text, "wrap": True}],
+    }
 
 
 def has_thread_metadata(post: Dict[str, Any], parent_post_id: str) -> bool:
