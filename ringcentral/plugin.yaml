@@ -8,6 +8,10 @@ provides_tools:
   - ringcentral_get_calendar_event
   - ringcentral_update_calendar_event
   - ringcentral_delete_calendar_event
+  - ringcentral_create_adaptive_card
+  - ringcentral_get_adaptive_card
+  - ringcentral_update_adaptive_card
+  - ringcentral_delete_adaptive_card
 version: 1.0.0
 description: >
   RingCentral Team Messaging gateway adapter for Hermes Agent.
