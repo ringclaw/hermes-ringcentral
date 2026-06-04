@@ -142,6 +142,9 @@ class TestRingCentralClientOAuth:
             "grant_type": JWT_GRANT_TYPE,
             "assertion": "jwt-token",
         }
+        assert session.post_kwargs["headers"]["Accept"] == "application/json"
+        assert session.post_kwargs["headers"]["Authorization"].startswith("Basic ")
+        assert "auth" not in session.post_kwargs
 
     def test_websocket_token_uses_wstoken_endpoint(self):
         calls = []
@@ -576,6 +579,67 @@ class TestWebSocketEchoDedup:
             {"event": "/team-messaging/v1/posts", "body": body},
         ]
         asyncio.run(ws._dispatch(event))
+        callback.assert_awaited_once_with(body)
+
+    def test_subscription_response_emits_safe_state(self):
+        callback = AsyncMock()
+        on_state = AsyncMock()
+        ws = RingCentralWebSocket(
+            client=MagicMock(),
+            on_event=callback,
+            on_state=on_state,
+        )
+        event = [
+            {"type": "ClientResponse", "status": 200},
+            {"id": "sub-1", "uuid": "uuid-1"},
+        ]
+
+        asyncio.run(ws._dispatch(event))
+
+        on_state.assert_awaited_once_with("ws_subscription_confirmed", {"status": 200})
+        callback.assert_not_awaited()
+
+    def test_client_request_subscription_response_emits_safe_state(self):
+        callback = AsyncMock()
+        on_state = AsyncMock()
+        ws = RingCentralWebSocket(
+            client=MagicMock(),
+            on_event=callback,
+            on_state=on_state,
+        )
+        event = [
+            {"type": "ClientRequest", "status": 200},
+            {"id": "sub-1", "uuid": "uuid-1"},
+        ]
+
+        asyncio.run(ws._dispatch(event))
+
+        on_state.assert_awaited_once_with("ws_subscription_confirmed", {"status": 200})
+        callback.assert_not_awaited()
+
+    def test_post_notification_emits_safe_state(self):
+        callback = AsyncMock()
+        on_state = AsyncMock()
+        ws = RingCentralWebSocket(
+            client=MagicMock(),
+            on_event=callback,
+            on_state=on_state,
+        )
+        body = {
+            "eventType": "PostAdded",
+            "id": "p-88",
+            "groupId": "g-1",
+            "creatorId": "user-2",
+            "text": "hi from ws array",
+        }
+        event = [
+            {"type": "ServerNotification", "status": 200},
+            {"event": "/team-messaging/v1/posts", "body": body},
+        ]
+
+        asyncio.run(ws._dispatch(event))
+
+        on_state.assert_awaited_once_with("ws_post_received", {})
         callback.assert_awaited_once_with(body)
 
     def test_history_bounded(self):

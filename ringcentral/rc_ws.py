@@ -18,12 +18,13 @@ own RC person ID are also filtered.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
 import uuid
 from collections import deque
-from typing import Any, Awaitable, Callable, Deque, Optional, Set
+from typing import Any, Awaitable, Callable, Deque, Dict, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .rc_client import RingCentralClient
@@ -48,6 +49,7 @@ DEFAULT_EVENT_FILTERS = ["/team-messaging/v1/posts"]
 
 
 EventCallback = Callable[[dict], Awaitable[None]]
+StateCallback = Callable[[str, Dict[str, Any]], Awaitable[None] | None]
 
 
 class RingCentralWebSocket:
@@ -67,6 +69,7 @@ class RingCentralWebSocket:
         event_filters: Optional[list] = None,
         filter_own_creator: bool = True,
         label: str = "bot",
+        on_state: Optional[StateCallback] = None,
     ) -> None:
         self._client = client
         self._on_event = on_event
@@ -74,6 +77,7 @@ class RingCentralWebSocket:
         self._event_filters = list(event_filters or DEFAULT_EVENT_FILTERS)
         self._filter_own_creator = filter_own_creator
         self._label = label or "bot"
+        self._on_state = on_state
 
         # Dedup: our own outbound post IDs. ``deque`` for O(1) FIFO bounds,
         # ``set`` for O(1) lookup — kept in sync.
@@ -195,6 +199,7 @@ class RingCentralWebSocket:
             raise
 
         logger.info("RC WebSocket (%s): connected", self._label)
+        await self._emit_state("ws_connected")
         await self._send_subscription_request()
 
         try:
@@ -225,6 +230,21 @@ class RingCentralWebSocket:
 
     async def _dispatch(self, event: Any) -> None:
         """Filter system frames + own-message echoes, then call ``on_event``."""
+        client_response_status = self._client_response_status(event)
+        if client_response_status is not None:
+            if 200 <= client_response_status < 300:
+                await self._emit_state(
+                    "ws_subscription_confirmed",
+                    status=client_response_status,
+                )
+            else:
+                logger.warning("RC WebSocket subscription response %s", client_response_status)
+                await self._emit_state(
+                    "ws_subscription_rejected",
+                    status=client_response_status,
+                )
+            return
+
         # RC sends control frames (heartbeats, connection-details, etc.) on
         # the same channel as event payloads. Real events have a ``body``
         # dict with the resource payload.
@@ -248,6 +268,7 @@ class RingCentralWebSocket:
             return
 
         try:
+            await self._emit_state("ws_post_received")
             await self._on_event(body)
         except Exception:
             logger.exception("RC WebSocket: on_event callback raised")
@@ -290,6 +311,7 @@ class RingCentralWebSocket:
             },
         ]
         await self._ws.send_str(json.dumps(message))
+        await self._emit_state("ws_subscription_request_sent")
         logger.info(
             "RC WebSocket (%s): subscription request sent for %d event filter(s)",
             self._label,
@@ -302,7 +324,7 @@ class RingCentralWebSocket:
         if isinstance(event, list) and len(event) >= 2:
             meta = event[0] if isinstance(event[0], dict) else {}
             payload = event[1] if isinstance(event[1], dict) else {}
-            if meta.get("type") == "ClientResponse":
+            if meta.get("type") in {"ClientRequest", "ClientResponse"}:
                 try:
                     status = int(meta.get("status") or 0)
                 except (TypeError, ValueError):
@@ -316,6 +338,25 @@ class RingCentralWebSocket:
             return event.get("body") if isinstance(event.get("body"), dict) else None
 
         return None
+
+    @staticmethod
+    def _client_response_status(event: Any) -> Optional[int]:
+        if not (isinstance(event, list) and len(event) >= 1 and isinstance(event[0], dict)):
+            return None
+        meta = event[0]
+        if meta.get("type") not in {"ClientRequest", "ClientResponse"}:
+            return None
+        try:
+            return int(meta.get("status") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _emit_state(self, event: str, **details: Any) -> None:
+        if self._on_state is None:
+            return
+        result = self._on_state(event, details)
+        if inspect.isawaitable(result):
+            await result
 
 
 class _PermanentAuthError(RuntimeError):
