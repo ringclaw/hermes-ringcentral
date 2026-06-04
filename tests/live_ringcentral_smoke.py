@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import pytest
@@ -39,16 +41,14 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.asyncio
 async def test_ringcentral_live_smoke() -> None:
-    from ringcentral.rc_client import RingCentralClient
+    global active_summary
 
-    env = read_live_env()
-    bot_client = RingCentralClient(env.bot_token, env.server_url)
-    owner_client = RingCentralClient.from_jwt(
-        client_id=env.owner_client_id,
-        client_secret=env.owner_client_secret,
-        jwt_token=env.owner_jwt_token,
-        server_url=env.server_url,
-    )
+    summary = LiveSummary("hermes-ringcentral")
+    summary.set_context(build_base_summary_context())
+    active_summary = summary
+    env: Optional[LiveEnv] = None
+    bot_client: Any = None
+    owner_client: Any = None
     created_bot_post_ids: List[str] = []
     created_owner_post_ids: List[str] = []
     ringcentral_logger = logging.getLogger("ringcentral")
@@ -56,6 +56,18 @@ async def test_ringcentral_live_smoke() -> None:
     ringcentral_logger.setLevel(logging.CRITICAL)
 
     try:
+        from ringcentral.rc_client import RingCentralClient
+
+        env = read_live_env()
+        summary.set_context(build_summary_context(env))
+        bot_client = RingCentralClient(env.bot_token, env.server_url)
+        owner_client = RingCentralClient.from_jwt(
+            client_id=env.owner_client_id,
+            client_secret=env.owner_client_secret,
+            jwt_token=env.owner_jwt_token,
+            server_url=env.server_url,
+        )
+
         log_safe("live_start", chat=mask_id(env.chat_id))
 
         bot_extension = await live_step("bot_auth", bot_client.get_own_extension)
@@ -105,20 +117,29 @@ async def test_ringcentral_live_smoke() -> None:
             created_bot_post_ids=created_bot_post_ids,
             created_owner_post_ids=created_owner_post_ids,
         )
+    except Exception as exc:  # noqa: BLE001
+        summary.fail(exc)
+        raise
     finally:
         try:
-            await cleanup_posts(
-                cleanup=env.cleanup,
-                chat_id=env.chat_id,
-                bot_client=bot_client,
-                owner_client=owner_client,
-                bot_post_ids=created_bot_post_ids,
-                owner_post_ids=created_owner_post_ids,
-            )
-            await bot_client.close()
-            await owner_client.close()
+            if env and bot_client and owner_client:
+                await cleanup_posts(
+                    cleanup=env.cleanup,
+                    chat_id=env.chat_id,
+                    bot_client=bot_client,
+                    owner_client=owner_client,
+                    bot_post_ids=created_bot_post_ids,
+                    owner_post_ids=created_owner_post_ids,
+                )
+            if bot_client:
+                await bot_client.close()
+            if owner_client:
+                await owner_client.close()
         finally:
             ringcentral_logger.setLevel(previous_log_level)
+            summary.write()
+            if active_summary is summary:
+                active_summary = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +153,102 @@ class LiveEnv:
     record_count: int
     cleanup: bool
     ws_timeout_ms: int
+
+
+class LiveSummary:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.status = "passed"
+        self.context: Dict[str, Any] = {}
+        self.rows: Dict[str, Dict[str, Any]] = {}
+        self.failure: Optional[Dict[str, str]] = None
+
+    def set_context(self, details: Dict[str, Any]) -> None:
+        self.context.update(details)
+
+    def record(self, stage: str, details: Dict[str, Any]) -> None:
+        row = self.rows.setdefault(
+            stage,
+            {
+                "stage": stage,
+                "status": "info",
+                "details": {},
+            },
+        )
+        row["details"].update(details)
+        if details.get("ok") is True:
+            row["status"] = "ok"
+        elif details.get("ok") is False:
+            row["status"] = "failed"
+        if isinstance(details.get("duration_ms"), (int, float)):
+            row["duration_ms"] = int(details["duration_ms"])
+
+    def fail(self, exc: Exception) -> None:
+        self.status = "failed"
+        self.failure = summarize_failure_for_summary(exc)
+        self.record(
+            self.failure["stage"],
+            {
+                "ok": False,
+                "error": self.failure["error"],
+            },
+        )
+
+    def write(self) -> None:
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()
+        if not summary_path:
+            return
+        with Path(summary_path).open("a", encoding="utf-8") as summary_file:
+            summary_file.write(f"{self.to_markdown()}\n")
+
+    def to_markdown(self) -> str:
+        context_rows = "\n".join(
+            f"| {escape_markdown_cell(key)} | {escape_markdown_cell(value)} |"
+            for key, value in self.context.items()
+        )
+        stage_rows = "\n".join(
+            self.format_stage_row(row)
+            for row in self.rows.values()
+        )
+        failure = ""
+        if self.failure:
+            failure = (
+                f"\n\nFailure: {escape_markdown_cell(self.failure['stage'])} "
+                f"{escape_markdown_cell(self.failure['error'])}"
+            )
+        return "\n".join(
+            [
+                f"## {self.name} live smoke",
+                "",
+                f"Overall: {self.status}",
+                "",
+                "| Context | Value |",
+                "| --- | --- |",
+                context_rows or "| none | none |",
+                "",
+                "| Stage | Status | Duration ms | Details |",
+                "| --- | --- | ---: | --- |",
+                stage_rows or "| none | info |  |  |",
+                failure,
+            ]
+        )
+
+    @staticmethod
+    def format_stage_row(row: Dict[str, Any]) -> str:
+        details = " ".join(
+            f"{key}={format_summary_value(value)}"
+            for key, value in row["details"].items()
+            if key not in {"ok", "duration_ms"}
+        )
+        return (
+            f"| {escape_markdown_cell(row['stage'])} | "
+            f"{escape_markdown_cell(row['status'])} | "
+            f"{escape_markdown_cell(row.get('duration_ms', ''))} | "
+            f"{escape_markdown_cell(details)} |"
+        )
+
+
+active_summary: Optional[LiveSummary] = None
 
 
 def read_live_env() -> LiveEnv:
@@ -157,6 +274,24 @@ def read_live_env() -> LiveEnv:
     if missing:
         raise RuntimeError(f"Missing RingCentral live smoke variables: {', '.join(missing)}")
     return env
+
+
+def build_summary_context(env: LiveEnv) -> Dict[str, Any]:
+    return {
+        **build_base_summary_context(),
+        "cleanup": env.cleanup,
+        "record_count": env.record_count,
+        "ws_timeout_ms": env.ws_timeout_ms,
+    }
+
+
+def build_base_summary_context() -> Dict[str, Any]:
+    return {
+        "repository": os.getenv("GITHUB_REPOSITORY", "local"),
+        "event": os.getenv("GITHUB_EVENT_NAME", "local"),
+        "source_present": bool(os.getenv("RC_E2E_SOURCE_URL", "").strip()),
+        "commit_present": bool(os.getenv("RC_E2E_COMMIT_SHA", "").strip()),
+    }
 
 
 def read_positive_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -613,22 +748,81 @@ def sanitize_diagnostic(event: str, details: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def log_safe(event: str, **details: Any) -> None:
-    suffix = " ".join(f"{key}={format_safe_value(value)}" for key, value in details.items())
+    safe_details = {
+        key: format_safe_value(value)
+        for key, value in details.items()
+    }
+    suffix = " ".join(f"{key}={format_safe_display(value)}" for key, value in safe_details.items())
     print(f"[hermes-ringcentral-live] event={event}{f' {suffix}' if suffix else ''}", flush=True)
+    if active_summary:
+        active_summary.record(event, safe_details)
 
 
-def format_safe_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
+def format_safe_value(value: Any) -> Any:
     if isinstance(value, (int, float)):
-        return str(value)
+        return value
     raw = str(value)
-    if raw.startswith("<masked:length=") or raw in {
-        "ws_connected",
-        "ws_subscription_confirmed",
-        "ws_subscription_rejected",
-        "ws_subscription_request_sent",
-        "ws_post_received",
-    }:
+    if raw.startswith("<masked:length=") or raw in SAFE_STRING_VALUES or re.match(
+        r"^HTTP \d{3}(?: [A-Z0-9_-]+)?$",
+        raw,
+    ):
         return raw
     return "<masked>"
+
+
+def format_safe_display(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+SAFE_STRING_VALUES = {
+    "<masked>",
+    "ws_connected",
+    "ws_subscription_confirmed",
+    "ws_subscription_rejected",
+    "ws_subscription_request_sent",
+    "ws_post_received",
+    "timeout",
+    "assertion failed",
+    "failed",
+    "missing required variables",
+}
+
+
+def summarize_failure_for_summary(exc: Exception) -> Dict[str, str]:
+    message = str(exc)
+    match = re.match(r"^Hermes RingCentral live smoke failed at ([a-z0-9_]+): (.+)$", message)
+    if match:
+        return {
+            "stage": match.group(1),
+            "error": sanitize_failure_message(match.group(2)),
+        }
+    if message.startswith("Missing RingCentral live smoke variables:"):
+        return {
+            "stage": "configuration",
+            "error": "missing required variables",
+        }
+    return {
+        "stage": "unknown",
+        "error": "failed",
+    }
+
+
+def sanitize_failure_message(message: str) -> str:
+    clean = message.strip()
+    if re.match(r"^HTTP \d{3}(?: [A-Z0-9_-]+)?$", clean):
+        return clean
+    if clean in SAFE_STRING_VALUES:
+        return clean
+    return "failed"
+
+
+def escape_markdown_cell(value: Any) -> str:
+    return format_summary_value(value).replace("|", "\\|").replace("\n", " ")
+
+
+def format_summary_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
