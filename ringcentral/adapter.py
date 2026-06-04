@@ -98,12 +98,6 @@ _PROCESSING_EMOJI_DELAYED = "⏳"
 _DEFAULT_PROCESSING_EMOJI_EDIT_DELAY_SECONDS = 5.0
 
 _RINGCENTRAL_HISTORY_TOOL_NAME = "ringcentral_get_recent_messages"
-_RINGCENTRAL_LIST_NOTES_TOOL_NAME = "ringcentral_list_notes"
-_RINGCENTRAL_CREATE_NOTE_TOOL_NAME = "ringcentral_create_note"
-_RINGCENTRAL_GET_NOTE_TOOL_NAME = "ringcentral_get_note"
-_RINGCENTRAL_UPDATE_NOTE_TOOL_NAME = "ringcentral_update_note"
-_RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
-_RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
 _RINGCENTRAL_HISTORY_SCHEMA = {
     "name": _RINGCENTRAL_HISTORY_TOOL_NAME,
     "description": (
@@ -145,6 +139,96 @@ _RINGCENTRAL_HISTORY_SCHEMA = {
             },
         },
         "required": ["target"],
+    },
+}
+
+_RINGCENTRAL_LIST_EVENTS_TOOL_NAME = "ringcentral_list_calendar_events"
+_RINGCENTRAL_CREATE_EVENT_TOOL_NAME = "ringcentral_create_calendar_event"
+_RINGCENTRAL_GET_EVENT_TOOL_NAME = "ringcentral_get_calendar_event"
+_RINGCENTRAL_UPDATE_EVENT_TOOL_NAME = "ringcentral_update_calendar_event"
+_RINGCENTRAL_DELETE_EVENT_TOOL_NAME = "ringcentral_delete_calendar_event"
+_RINGCENTRAL_LIST_NOTES_TOOL_NAME = "ringcentral_list_notes"
+_RINGCENTRAL_CREATE_NOTE_TOOL_NAME = "ringcentral_create_note"
+_RINGCENTRAL_GET_NOTE_TOOL_NAME = "ringcentral_get_note"
+_RINGCENTRAL_UPDATE_NOTE_TOOL_NAME = "ringcentral_update_note"
+_RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
+_RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
+
+_EVENT_WRITE_PROPERTIES = {
+    "title": {"type": "string", "description": "Calendar event title."},
+    "start_time": {
+        "type": "string",
+        "description": "Event start time as an ISO-8601 timestamp.",
+    },
+    "end_time": {
+        "type": "string",
+        "description": "Event end time as an ISO-8601 timestamp.",
+    },
+    "description": {"type": "string", "description": "Optional event description."},
+    "location": {"type": "string", "description": "Optional event location."},
+    "all_day": {"type": "boolean", "description": "Whether this is an all-day event."},
+}
+
+_RINGCENTRAL_LIST_EVENTS_SCHEMA = {
+    "name": _RINGCENTRAL_LIST_EVENTS_TOOL_NAME,
+    "description": "List RingCentral calendar events in the current group/team chat. Owner credentials are required.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "record_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "How many events to fetch. Defaults to 50.",
+            },
+        },
+    },
+}
+
+_RINGCENTRAL_CREATE_EVENT_SCHEMA = {
+    "name": _RINGCENTRAL_CREATE_EVENT_TOOL_NAME,
+    "description": "Create a RingCentral calendar event in the current group/team chat. Owner credentials are required.",
+    "parameters": {
+        "type": "object",
+        "properties": _EVENT_WRITE_PROPERTIES,
+        "required": ["title", "start_time", "end_time"],
+    },
+}
+
+_RINGCENTRAL_GET_EVENT_SCHEMA = {
+    "name": _RINGCENTRAL_GET_EVENT_TOOL_NAME,
+    "description": "Read a RingCentral calendar event by event ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "RingCentral calendar event ID."},
+        },
+        "required": ["event_id"],
+    },
+}
+
+_RINGCENTRAL_UPDATE_EVENT_SCHEMA = {
+    "name": _RINGCENTRAL_UPDATE_EVENT_TOOL_NAME,
+    "description": "Update a RingCentral calendar event by event ID. Title, start_time, and end_time are required.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "RingCentral calendar event ID."},
+            **_EVENT_WRITE_PROPERTIES,
+        },
+        "required": ["event_id", "title", "start_time", "end_time"],
+    },
+}
+
+_RINGCENTRAL_DELETE_EVENT_SCHEMA = {
+    "name": _RINGCENTRAL_DELETE_EVENT_TOOL_NAME,
+    "description": "Delete a RingCentral calendar event by event ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "RingCentral calendar event ID."},
+        },
+        "required": ["event_id"],
     },
 }
 
@@ -2708,6 +2792,21 @@ def _ringcentral_owner_tool_available() -> bool:
     return bool(_owner_credentials_from({}))
 
 
+def _history_record_count_from_arg(raw: Any) -> int:
+    if raw in (None, ""):
+        return _history_message_limit_from({})
+    return _history_message_limit_from({"history_message_limit": raw})
+
+
+def _session_env(name: str, default: str = "") -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env(name, default)
+    except Exception:
+        return os.getenv(name, default)
+
+
 def _note_record_count_from_arg(raw: Any) -> int:
     try:
         value = int(float(str(raw)))
@@ -2752,20 +2851,19 @@ async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Option
     if not owner_creds:
         return None, "", "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
 
-    server_url = os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL
     client = RingCentralClient.from_jwt(
         client_id=owner_creds["client_id"],
         client_secret=owner_creds["client_secret"],
         jwt_token=owner_creds["jwt_token"],
-        server_url=server_url,
+        server_url=os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL,
     )
     ext = await client.get_own_extension()
     if not isinstance(ext, dict) or not ext.get("id"):
         await client.close()
         return None, "", "RingCentral owner authentication failed."
 
-    contact = ext.get("contact") if isinstance(ext.get("contact"), dict) else {}
-    owner_email = _normalize_email(contact.get("email"))
+    contact = ext.get("contact") or {}
+    owner_email = _normalize_email(contact.get("email") or "")
     owner_person_id = str(ext.get("id") or client.owner_id or "")
     session_user_norm = _normalize_email(session_user_id)
     if not (
@@ -2776,6 +2874,188 @@ async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Option
         return None, "", "Only the configured RingCentral owner can manage notes."
 
     return client, session_chat_id, None
+
+
+def _event_record_count_from_arg(raw: Any) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 50
+    return max(1, min(value, 100))
+
+
+def _event_id_from_args(args: Dict[str, Any]) -> str:
+    return str(args.get("event_id") or args.get("id") or "").strip()
+
+
+def _event_write_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    title = str(args.get("title") or "").strip()
+    start_time = str(args.get("start_time") or args.get("startTime") or args.get("start") or "").strip()
+    end_time = str(args.get("end_time") or args.get("endTime") or args.get("end") or "").strip()
+    if title:
+        payload["title"] = title
+    if start_time:
+        payload["startTime"] = start_time
+    if end_time:
+        payload["endTime"] = end_time
+    if args.get("description") not in (None, ""):
+        payload["description"] = str(args.get("description"))
+    if args.get("location") not in (None, ""):
+        payload["location"] = str(args.get("location"))
+    if "all_day" in args:
+        payload["allDay"] = bool(args.get("all_day"))
+    elif "allDay" in args:
+        payload["allDay"] = bool(args.get("allDay"))
+    return payload
+
+
+def _event_write_payload_complete(payload: Dict[str, Any]) -> bool:
+    return bool(payload.get("title") and payload.get("startTime") and payload.get("endTime"))
+
+
+def _event_summary(event: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "id": str(event.get("id") or ""),
+        "title": str(event.get("title") or ""),
+        "start_time": str(event.get("startTime") or ""),
+        "end_time": str(event.get("endTime") or ""),
+    }
+
+
+async def _owner_current_chat_client() -> tuple[Optional[RingCentralClient], str, Optional[str]]:
+    platform = _session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    session_chat_id = _session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    session_user_id = _session_env("HERMES_SESSION_USER_ID", "").strip()
+    if platform != "ringcentral":
+        return None, "", "RingCentral calendar tools can only be used from a RingCentral session."
+    if not session_chat_id:
+        return None, "", "RingCentral session chat_id is missing."
+    if not session_user_id:
+        return None, "", "RingCentral session user_id is missing."
+
+    owner_creds = _owner_credentials_from({})
+    if not owner_creds:
+        return None, "", "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
+
+    client = RingCentralClient.from_jwt(
+        client_id=owner_creds["client_id"],
+        client_secret=owner_creds["client_secret"],
+        jwt_token=owner_creds["jwt_token"],
+        server_url=os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL,
+    )
+    ext = await client.get_own_extension()
+    if not isinstance(ext, dict) or not ext.get("id"):
+        await client.close()
+        return None, "", "RingCentral owner authentication failed."
+
+    contact = ext.get("contact") or {}
+    owner_email = _normalize_email(contact.get("email") or "")
+    owner_id = str(ext.get("id") or client.owner_id or "")
+    session_user_norm = _normalize_email(session_user_id)
+    if not (
+        session_user_norm == owner_email
+        or session_user_id == owner_id
+    ):
+        await client.close()
+        return None, "", "Only the configured RingCentral owner can manage calendar events."
+
+    return client, session_chat_id, None
+
+
+async def _ringcentral_list_calendar_events(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    client, chat_id, error = await _owner_current_chat_client()
+    if error or client is None:
+        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    try:
+        events = await client.list_events(chat_id, _event_record_count_from_arg(args.get("record_count")))
+        if events is None:
+            return _ringcentral_tool_error("RingCentral returned no calendar events for the current chat.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "events": [_event_summary(event) for event in events],
+            "fetched_count": len(events),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_create_calendar_event(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    payload = _event_write_payload(args)
+    if not _event_write_payload_complete(payload):
+        return _ringcentral_tool_error("title, start_time, and end_time are required.")
+    client, chat_id, error = await _owner_current_chat_client()
+    if error or client is None:
+        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    try:
+        event = await client.create_event(chat_id, payload)
+        if not isinstance(event, dict) or not event.get("id"):
+            return _ringcentral_tool_error("RingCentral calendar event create failed.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "event_id": str(event.get("id")),
+            "event": _event_summary(event),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_get_calendar_event(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    event_id = _event_id_from_args(args)
+    if not event_id:
+        return _ringcentral_tool_error("event_id is required.")
+    client, _, error = await _owner_current_chat_client()
+    if error or client is None:
+        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    try:
+        event = await client.get_event(event_id)
+        if not isinstance(event, dict) or not event.get("id"):
+            return _ringcentral_tool_error("RingCentral calendar event read failed.")
+        return _ringcentral_tool_json({"success": True, "event": event})
+    finally:
+        await client.close()
+
+
+async def _ringcentral_update_calendar_event(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    event_id = _event_id_from_args(args)
+    if not event_id:
+        return _ringcentral_tool_error("event_id is required.")
+    payload = _event_write_payload(args)
+    if not _event_write_payload_complete(payload):
+        return _ringcentral_tool_error("title, start_time, and end_time are required.")
+    client, _, error = await _owner_current_chat_client()
+    if error or client is None:
+        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    try:
+        event = await client.update_event(event_id, payload)
+        if not isinstance(event, dict) or not event.get("id"):
+            return _ringcentral_tool_error("RingCentral calendar event update failed.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "event_id": str(event.get("id")),
+            "event": _event_summary(event),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_delete_calendar_event(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    event_id = _event_id_from_args(args)
+    if not event_id:
+        return _ringcentral_tool_error("event_id is required.")
+    client, _, error = await _owner_current_chat_client()
+    if error or client is None:
+        return _ringcentral_tool_error(error or "RingCentral owner client unavailable.")
+    try:
+        deleted = await client.delete_event(event_id)
+        return _ringcentral_tool_json({"success": bool(deleted), "event_id": event_id})
+    finally:
+        await client.close()
 
 
 async def _ringcentral_list_notes(args: Dict[str, Any], **_: Any) -> str:
@@ -2899,21 +3179,6 @@ async def _ringcentral_publish_note(args: Dict[str, Any], **_: Any) -> str:
         return _ringcentral_tool_json({"success": bool(published), "published": bool(published)})
     finally:
         await client.close()
-
-
-def _history_record_count_from_arg(raw: Any) -> int:
-    if raw in (None, ""):
-        return _history_message_limit_from({})
-    return _history_message_limit_from({"history_message_limit": raw})
-
-
-def _session_env(name: str, default: str = "") -> str:
-    try:
-        from gateway.session_context import get_session_env
-
-        return get_session_env(name, default)
-    except Exception:
-        return os.getenv(name, default)
 
 
 async def _ringcentral_get_recent_messages(args: Dict[str, Any], **_: Any) -> str:
@@ -3337,6 +3602,51 @@ def register(ctx) -> None:
         check_fn=_ringcentral_history_tool_available,
         is_async=True,
         emoji="📜",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_LIST_EVENTS_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_LIST_EVENTS_SCHEMA,
+        handler=_ringcentral_list_calendar_events,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📅",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_CREATE_EVENT_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_CREATE_EVENT_SCHEMA,
+        handler=_ringcentral_create_calendar_event,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📅",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_GET_EVENT_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_GET_EVENT_SCHEMA,
+        handler=_ringcentral_get_calendar_event,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📅",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_UPDATE_EVENT_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_UPDATE_EVENT_SCHEMA,
+        handler=_ringcentral_update_calendar_event,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📅",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_DELETE_EVENT_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_DELETE_EVENT_SCHEMA,
+        handler=_ringcentral_delete_calendar_event,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📅",
     )
     ctx.register_tool(
         name=_RINGCENTRAL_LIST_NOTES_TOOL_NAME,

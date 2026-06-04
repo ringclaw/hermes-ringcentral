@@ -3,6 +3,11 @@ label: RingCentral
 kind: platform
 provides_tools:
   - ringcentral_get_recent_messages
+  - ringcentral_list_calendar_events
+  - ringcentral_create_calendar_event
+  - ringcentral_get_calendar_event
+  - ringcentral_update_calendar_event
+  - ringcentral_delete_calendar_event
   - ringcentral_list_notes
   - ringcentral_create_note
   - ringcentral_get_note

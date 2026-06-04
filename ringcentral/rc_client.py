@@ -16,14 +16,19 @@ Endpoints covered:
 * ``GET    /team-messaging/v1/persons/{personID}``            — person info
 * ``POST   /restapi/v1.0/account/~/directory/entries/search`` — directory search
 * ``POST   /team-messaging/v1/files``                         — upload file
-* ``GET    /restapi/v1.0/account/~/extension/~``              — own extension
-* ``POST   /team-messaging/v1/conversations``                 — create/find DM
+* ``GET    /team-messaging/v1/groups/{groupID}/events``       — list calendar events
+* ``POST   /team-messaging/v1/groups/{groupID}/events``       — create calendar event
+* ``GET    /team-messaging/v1/events/{eventID}``              — read calendar event
+* ``PUT    /team-messaging/v1/events/{eventID}``              — update calendar event
+* ``DELETE /team-messaging/v1/events/{eventID}``              — delete calendar event
 * ``GET    /team-messaging/v1/chats/{chatID}/notes``          — list notes
 * ``POST   /team-messaging/v1/chats/{chatID}/notes``          — create note
 * ``GET    /team-messaging/v1/notes/{noteID}``                — read note
 * ``PATCH  /team-messaging/v1/notes/{noteID}``                — update note
 * ``DELETE /team-messaging/v1/notes/{noteID}``                — delete note
 * ``POST   /team-messaging/v1/notes/{noteID}/publish``        — publish note
+* ``GET    /restapi/v1.0/account/~/extension/~``              — own extension
+* ``POST   /team-messaging/v1/conversations``                 — create/find DM
 * ``POST   /restapi/oauth/wstoken``                            — WebSocket token
 
 All methods return either the parsed JSON dict on success or ``None`` on
@@ -458,6 +463,75 @@ class RingCentralClient:
         return data.get("records", []) if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------
+    # Calendar events
+    # ------------------------------------------------------------------
+
+    async def list_events(
+        self,
+        group_id: str,
+        record_count: int = 50,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """List calendar events in a RingCentral group/team chat."""
+        if not group_id:
+            return None
+        path = (
+            f"/team-messaging/v1/groups/{quote(group_id, safe='')}/events"
+            f"?recordCount={int(record_count)}"
+        )
+        data = await self._request("GET", path)
+        if not data:
+            return None
+        return data.get("records", []) if isinstance(data, dict) else None
+
+    async def create_event(
+        self,
+        group_id: str,
+        event: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create a calendar event in a RingCentral group/team chat."""
+        if not group_id:
+            return None
+        return await self._request(
+            "POST",
+            f"/team-messaging/v1/groups/{quote(group_id, safe='')}/events",
+            json_body=event,
+        )
+
+    async def get_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one calendar event by ID."""
+        if not event_id:
+            return None
+        return await self._request(
+            "GET",
+            f"/team-messaging/v1/events/{quote(event_id, safe='')}",
+        )
+
+    async def update_event(
+        self,
+        event_id: str,
+        event: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Replace a calendar event by ID."""
+        if not event_id:
+            return None
+        return await self._request(
+            "PUT",
+            f"/team-messaging/v1/events/{quote(event_id, safe='')}",
+            json_body=event,
+        )
+
+    async def delete_event(self, event_id: str) -> bool:
+        """Delete a calendar event by ID. Returns True on success."""
+        if not event_id:
+            return False
+        result = await self._request(
+            "DELETE",
+            f"/team-messaging/v1/events/{quote(event_id, safe='')}",
+            expect_json=False,
+        )
+        return result is not None
+
+    # ------------------------------------------------------------------
     # Notes
     # ------------------------------------------------------------------
 
@@ -466,7 +540,7 @@ class RingCentralClient:
         chat_id: str,
         record_count: int = 50,
     ) -> Optional[List[Dict[str, Any]]]:
-        """List notes in a chat."""
+        """List notes in a RingCentral chat."""
         if not chat_id:
             return None
         data = await self._request(
@@ -482,7 +556,7 @@ class RingCentralClient:
         chat_id: str,
         note: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Create a draft note in ``chat_id``."""
+        """Create a draft note in a RingCentral chat."""
         if not chat_id:
             return None
         return await self._request(
