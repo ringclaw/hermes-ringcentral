@@ -873,7 +873,8 @@ class TestPluginRegistration:
                 self.platform_kwargs = kwargs
 
             def register_tool(self, **kwargs):
-                self.tool_kwargs = kwargs
+                self.tool_kwargs_list = getattr(self, "tool_kwargs_list", [])
+                self.tool_kwargs_list.append(kwargs)
 
         ctx = Ctx()
         register(ctx)
@@ -884,11 +885,14 @@ class TestPluginRegistration:
         assert isinstance(adapter, RingCentralAdapter)
         assert ctx.platform_kwargs["allowed_users_env"] == "RC_ALLOWED_USER_EMAILS"
         assert ctx.platform_kwargs["allow_all_env"] == "RC_ALLOW_ALL_USERS"
-        assert ctx.tool_kwargs["name"] == _RINGCENTRAL_HISTORY_TOOL_NAME
-        assert ctx.tool_kwargs["toolset"] == "ringcentral"
-        assert ctx.tool_kwargs["handler"] is _ringcentral_get_recent_messages
-        assert ctx.tool_kwargs["check_fn"] is _ringcentral_history_tool_available
-        assert ctx.tool_kwargs["is_async"] is True
+        history_tool = next(
+            tool for tool in ctx.tool_kwargs_list
+            if tool["name"] == _RINGCENTRAL_HISTORY_TOOL_NAME
+        )
+        assert history_tool["toolset"] == "ringcentral"
+        assert history_tool["handler"] is _ringcentral_get_recent_messages
+        assert history_tool["check_fn"] is _ringcentral_history_tool_available
+        assert history_tool["is_async"] is True
 
 
 # ---------------------------------------------------------------------------
