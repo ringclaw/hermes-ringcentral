@@ -3,6 +3,7 @@ label: RingCentral
 kind: platform
 provides_tools:
   - ringcentral_get_recent_messages
+  - ringcentral_confirm_artifact_action
   - ringcentral_list_calendar_events
   - ringcentral_create_calendar_event
   - ringcentral_get_calendar_event

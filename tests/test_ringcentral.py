@@ -39,6 +39,7 @@ from ringcentral.adapter import (  # noqa: E402
     _normalize_allowed_user_emails_env,
     _require_mention,
     _ringcentral_bot_tool_available,
+    _ringcentral_confirm_artifact_action,
     _ringcentral_create_adaptive_card,
     _ringcentral_create_calendar_event,
     _ringcentral_create_note,
@@ -2375,6 +2376,8 @@ class TestRingCentralHistoryTool:
 
     def test_note_tools_use_owner_current_session(self, monkeypatch):
         self._set_owner_env(monkeypatch)
+        monkeypatch.setenv("RC_HOME_CHANNEL", "home-dm")
+        _rc_mod._PENDING_ARTIFACT_ACTIONS.clear()
         owner = MagicMock()
         owner.owner_id = "owner-1"
         owner.get_own_extension = AsyncMock(return_value={
@@ -2391,32 +2394,55 @@ class TestRingCentralHistoryTool:
 
         with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
             listed = self._call_calendar_tool(_ringcentral_list_notes, {"record_count": 10})
-            created = self._call_calendar_tool(
+            pending_create = self._call_calendar_tool(
                 _ringcentral_create_note,
                 {"title": "Note", "body": "<b>Body</b>", "publish": True},
             )
             read = self._call_calendar_tool(_ringcentral_get_note, {"note_id": "n1"})
-            updated = self._call_calendar_tool(_ringcentral_update_note, {"note_id": "n1", "title": "Updated"})
-            published = self._call_calendar_tool(_ringcentral_publish_note, {"note_id": "n1"})
-            deleted = self._call_calendar_tool(_ringcentral_delete_note, {"note_id": "n1"})
+            pending_update = self._call_calendar_tool(_ringcentral_update_note, {"note_id": "n1", "title": "Updated"})
+            pending_publish = self._call_calendar_tool(_ringcentral_publish_note, {"note_id": "n1"})
+            pending_delete = self._call_calendar_tool(_ringcentral_delete_note, {"note_id": "n1"})
+            rejected_confirm = self._call_calendar_tool(
+                _ringcentral_confirm_artifact_action,
+                {"confirmation_id": pending_create["confirmation_id"]},
+            )
+            confirmed = self._call_calendar_tool(
+                _ringcentral_confirm_artifact_action,
+                {"confirmation_id": pending_create["confirmation_id"]},
+                chat_id="home-dm",
+            )
+            reused = self._call_calendar_tool(
+                _ringcentral_confirm_artifact_action,
+                {"confirmation_id": pending_create["confirmation_id"]},
+                chat_id="home-dm",
+            )
 
         assert listed["success"] is True
         assert listed["notes"] == [{"id": "n1", "title": "Note", "status": "Draft"}]
-        assert created == {
+        assert pending_create["requires_confirmation"] is True
+        assert pending_create["target_chat_id"] == "g-1"
+        assert read["note"]["body"] == "<b>Body</b>"
+        assert pending_update["requires_confirmation"] is True
+        assert pending_publish["requires_confirmation"] is True
+        assert pending_delete["requires_confirmation"] is True
+        assert rejected_confirm["success"] is False
+        assert "Home DM" in rejected_confirm["error"]
+        assert confirmed == {
             "success": True,
             "note_id": "n1",
             "published": True,
             "note": {"id": "n1", "title": "Note", "status": "Draft"},
+            "confirmed": True,
+            "summary": "Create note: Note",
         }
-        assert read["note"]["body"] == "<b>Body</b>"
-        assert updated["note"] == {"id": "n1", "title": "Updated", "status": "Draft"}
-        assert published == {"success": True, "published": True}
-        assert deleted == {"success": True, "deleted": True}
+        assert reused["success"] is False
+        assert "Invalid or expired" in reused["error"]
         owner.list_notes.assert_awaited_once_with("g-1", 10)
         owner.create_note.assert_awaited_once_with("g-1", {"title": "Note", "body": "<b>Body</b>"})
         owner.publish_note.assert_any_await("n1")
-        owner.update_note.assert_awaited_once_with("n1", {"title": "Updated"})
-        assert owner.close.await_count == 6
+        owner.update_note.assert_not_awaited()
+        owner.delete_note.assert_not_awaited()
+        assert owner.close.await_count == 9
 
     def test_note_tool_rejects_non_owner_session_user(self, monkeypatch):
         self._set_owner_env(monkeypatch)
@@ -2439,8 +2465,32 @@ class TestRingCentralHistoryTool:
         assert "owner" in result["error"]
         owner.create_note.assert_not_called()
 
+    def test_owner_write_requires_home_channel(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        monkeypatch.delenv("RC_HOME_CHANNEL", raising=False)
+        owner = MagicMock()
+        owner.owner_id = "owner-1"
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+        owner.create_note = AsyncMock()
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            result = self._call_calendar_tool(
+                _ringcentral_create_note,
+                {"title": "Note"},
+            )
+
+        assert result["success"] is False
+        assert "RC_HOME_CHANNEL" in result["error"]
+        owner.create_note.assert_not_called()
+
     def test_calendar_event_tools_use_owner_current_session(self, monkeypatch):
         self._set_owner_env(monkeypatch)
+        monkeypatch.setenv("RC_HOME_CHANNEL", "home-dm")
+        _rc_mod._PENDING_ARTIFACT_ACTIONS.clear()
         owner = MagicMock()
         owner.get_own_extension = AsyncMock(return_value={
             "id": "owner-1",
@@ -2470,7 +2520,7 @@ class TestRingCentralHistoryTool:
 
         with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
             listed = self._call_calendar_tool(_ringcentral_list_calendar_events, {"record_count": 10})
-            created = self._call_calendar_tool(
+            pending_create = self._call_calendar_tool(
                 _ringcentral_create_calendar_event,
                 {
                     "title": "Planning",
@@ -2480,7 +2530,7 @@ class TestRingCentralHistoryTool:
                 },
             )
             read = self._call_calendar_tool(_ringcentral_get_calendar_event, {"event_id": "event-1"})
-            updated = self._call_calendar_tool(
+            pending_update = self._call_calendar_tool(
                 _ringcentral_update_calendar_event,
                 {
                     "event_id": "event-1",
@@ -2489,7 +2539,12 @@ class TestRingCentralHistoryTool:
                     "end_time": "2026-06-04T13:00:00Z",
                 },
             )
-            deleted = self._call_calendar_tool(_ringcentral_delete_calendar_event, {"event_id": "event-1"})
+            pending_delete = self._call_calendar_tool(_ringcentral_delete_calendar_event, {"event_id": "event-1"})
+            confirmed = self._call_calendar_tool(
+                _ringcentral_confirm_artifact_action,
+                {"confirmation_id": pending_create["confirmation_id"]},
+                chat_id="home-dm",
+            )
 
         assert listed["events"] == [{
             "id": "event-1",
@@ -2497,10 +2552,13 @@ class TestRingCentralHistoryTool:
             "start_time": "2026-06-04T10:00:00Z",
             "end_time": "2026-06-04T11:00:00Z",
         }]
-        assert created["event_id"] == "event-1"
+        assert pending_create["requires_confirmation"] is True
+        assert pending_create["target_chat_id"] == "g-1"
         assert read["event"]["id"] == "event-1"
-        assert updated["event"]["title"] == "Updated"
-        assert deleted == {"success": True, "event_id": "event-1"}
+        assert pending_update["requires_confirmation"] is True
+        assert pending_delete["requires_confirmation"] is True
+        assert confirmed["confirmed"] is True
+        assert confirmed["event_id"] == "event-1"
         owner.list_events.assert_awaited_once_with("g-1", 10)
         owner.create_event.assert_awaited_once_with("g-1", {
             "title": "Planning",
@@ -2509,13 +2567,9 @@ class TestRingCentralHistoryTool:
             "description": "Agenda",
         })
         owner.get_event.assert_awaited_once_with("event-1")
-        owner.update_event.assert_awaited_once_with("event-1", {
-            "title": "Updated",
-            "startTime": "2026-06-04T12:00:00Z",
-            "endTime": "2026-06-04T13:00:00Z",
-        })
-        owner.delete_event.assert_awaited_once_with("event-1")
-        assert owner.close.await_count == 5
+        owner.update_event.assert_not_awaited()
+        owner.delete_event.assert_not_awaited()
+        assert owner.close.await_count == 6
 
     def test_calendar_event_tool_rejects_non_owner_session_user(self, monkeypatch):
         self._set_owner_env(monkeypatch)
