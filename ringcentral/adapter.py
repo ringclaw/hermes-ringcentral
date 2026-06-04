@@ -236,6 +236,13 @@ _RINGCENTRAL_GET_NOTE_TOOL_NAME = "ringcentral_get_note"
 _RINGCENTRAL_UPDATE_NOTE_TOOL_NAME = "ringcentral_update_note"
 _RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
 _RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
+_NOTE_ID_DESCRIPTION = "RingCentral note ID."
+_NOTE_ID_REQUIRED_ERROR = "note_id is required."
+_SESSION_USER_ID_MISSING_ERROR = "RingCentral session user_id is missing."
+_OWNER_CREDENTIALS_MISSING_ERROR = (
+    "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
+)
+_OWNER_AUTH_FAILED_ERROR = "RingCentral owner authentication failed."
 
 _ADAPTIVE_CARD_PARAMETERS = {
     "type": "object",
@@ -344,7 +351,7 @@ _RINGCENTRAL_GET_NOTE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "note_id": {"type": "string", "description": "RingCentral note ID."},
+            "note_id": {"type": "string", "description": _NOTE_ID_DESCRIPTION},
         },
         "required": ["note_id"],
     },
@@ -356,7 +363,7 @@ _RINGCENTRAL_UPDATE_NOTE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "note_id": {"type": "string", "description": "RingCentral note ID."},
+            "note_id": {"type": "string", "description": _NOTE_ID_DESCRIPTION},
             **_NOTE_WRITE_PROPERTIES,
         },
         "required": ["note_id"],
@@ -369,7 +376,7 @@ _RINGCENTRAL_DELETE_NOTE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "note_id": {"type": "string", "description": "RingCentral note ID."},
+            "note_id": {"type": "string", "description": _NOTE_ID_DESCRIPTION},
         },
         "required": ["note_id"],
     },
@@ -381,7 +388,7 @@ _RINGCENTRAL_PUBLISH_NOTE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "note_id": {"type": "string", "description": "RingCentral note ID."},
+            "note_id": {"type": "string", "description": _NOTE_ID_DESCRIPTION},
         },
         "required": ["note_id"],
     },
@@ -2947,20 +2954,23 @@ def _note_id_from_args(args: Dict[str, Any]) -> str:
     return str(args.get("note_id") or args.get("id") or "").strip()
 
 
-async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Optional[str]]:
+async def _owner_chat_client_for(
+    tool_label: str,
+    owner_error: str,
+) -> tuple[Optional[RingCentralClient], str, Optional[str]]:
     platform = _session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
     session_chat_id = _session_env("HERMES_SESSION_CHAT_ID", "").strip()
     session_user_id = _session_env("HERMES_SESSION_USER_ID", "").strip()
     if platform != "ringcentral":
-        return None, "", "RingCentral note tools can only be used from a RingCentral session."
+        return None, "", f"RingCentral {tool_label} tools can only be used from a RingCentral session."
     if not session_chat_id:
         return None, "", "RingCentral session chat_id is missing."
     if not session_user_id:
-        return None, "", "RingCentral session user_id is missing."
+        return None, "", _SESSION_USER_ID_MISSING_ERROR
 
     owner_creds = _owner_credentials_from({})
     if not owner_creds:
-        return None, "", "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
+        return None, "", _OWNER_CREDENTIALS_MISSING_ERROR
 
     client = RingCentralClient.from_jwt(
         client_id=owner_creds["client_id"],
@@ -2971,7 +2981,7 @@ async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Option
     ext = await client.get_own_extension()
     if not isinstance(ext, dict) or not ext.get("id"):
         await client.close()
-        return None, "", "RingCentral owner authentication failed."
+        return None, "", _OWNER_AUTH_FAILED_ERROR
 
     contact = ext.get("contact") or {}
     owner_email = _normalize_email(contact.get("email") or "")
@@ -2982,9 +2992,16 @@ async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Option
         or session_user_id == owner_person_id
     ):
         await client.close()
-        return None, "", "Only the configured RingCentral owner can manage notes."
+        return None, "", owner_error
 
     return client, session_chat_id, None
+
+
+async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Optional[str]]:
+    return await _owner_chat_client_for(
+        "note",
+        "Only the configured RingCentral owner can manage notes.",
+    )
 
 
 def _event_record_count_from_arg(raw: Any) -> int:
@@ -3035,43 +3052,10 @@ def _event_summary(event: Dict[str, Any]) -> Dict[str, str]:
 
 
 async def _owner_current_chat_client() -> tuple[Optional[RingCentralClient], str, Optional[str]]:
-    platform = _session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
-    session_chat_id = _session_env("HERMES_SESSION_CHAT_ID", "").strip()
-    session_user_id = _session_env("HERMES_SESSION_USER_ID", "").strip()
-    if platform != "ringcentral":
-        return None, "", "RingCentral calendar tools can only be used from a RingCentral session."
-    if not session_chat_id:
-        return None, "", "RingCentral session chat_id is missing."
-    if not session_user_id:
-        return None, "", "RingCentral session user_id is missing."
-
-    owner_creds = _owner_credentials_from({})
-    if not owner_creds:
-        return None, "", "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
-
-    client = RingCentralClient.from_jwt(
-        client_id=owner_creds["client_id"],
-        client_secret=owner_creds["client_secret"],
-        jwt_token=owner_creds["jwt_token"],
-        server_url=os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL,
+    return await _owner_chat_client_for(
+        "calendar",
+        "Only the configured RingCentral owner can manage calendar events.",
     )
-    ext = await client.get_own_extension()
-    if not isinstance(ext, dict) or not ext.get("id"):
-        await client.close()
-        return None, "", "RingCentral owner authentication failed."
-
-    contact = ext.get("contact") or {}
-    owner_email = _normalize_email(contact.get("email") or "")
-    owner_id = str(ext.get("id") or client.owner_id or "")
-    session_user_norm = _normalize_email(session_user_id)
-    if not (
-        session_user_norm == owner_email
-        or session_user_id == owner_id
-    ):
-        await client.close()
-        return None, "", "Only the configured RingCentral owner can manage calendar events."
-
-    return client, session_chat_id, None
 
 
 async def _ringcentral_list_calendar_events(args: Dict[str, Any], **_: Any) -> str:
@@ -3309,7 +3293,7 @@ async def _ringcentral_get_note(args: Dict[str, Any], **_: Any) -> str:
     args = args or {}
     note_id = _note_id_from_args(args)
     if not note_id:
-        return _ringcentral_tool_error("note_id is required.")
+        return _ringcentral_tool_error(_NOTE_ID_REQUIRED_ERROR)
     client, _, error = await _owner_note_client()
     if error:
         return _ringcentral_tool_error(error)
@@ -3330,7 +3314,7 @@ async def _ringcentral_update_note(args: Dict[str, Any], **_: Any) -> str:
     args = args or {}
     note_id = _note_id_from_args(args)
     if not note_id:
-        return _ringcentral_tool_error("note_id is required.")
+        return _ringcentral_tool_error(_NOTE_ID_REQUIRED_ERROR)
     updates = _note_write_payload(args)
     if not updates:
         return _ringcentral_tool_error("title or body is required.")
@@ -3355,7 +3339,7 @@ async def _ringcentral_delete_note(args: Dict[str, Any], **_: Any) -> str:
     args = args or {}
     note_id = _note_id_from_args(args)
     if not note_id:
-        return _ringcentral_tool_error("note_id is required.")
+        return _ringcentral_tool_error(_NOTE_ID_REQUIRED_ERROR)
     client, _, error = await _owner_note_client()
     if error:
         return _ringcentral_tool_error(error)
@@ -3371,7 +3355,7 @@ async def _ringcentral_publish_note(args: Dict[str, Any], **_: Any) -> str:
     args = args or {}
     note_id = _note_id_from_args(args)
     if not note_id:
-        return _ringcentral_tool_error("note_id is required.")
+        return _ringcentral_tool_error(_NOTE_ID_REQUIRED_ERROR)
     client, _, error = await _owner_note_client()
     if error:
         return _ringcentral_tool_error(error)
@@ -3400,16 +3384,14 @@ async def _ringcentral_get_recent_messages(args: Dict[str, Any], **_: Any) -> st
     if not session_chat_id:
         return _ringcentral_tool_error("RingCentral session chat_id is missing.")
     if not session_user_id:
-        return _ringcentral_tool_error("RingCentral session user_id is missing.")
+        return _ringcentral_tool_error(_SESSION_USER_ID_MISSING_ERROR)
 
     token = os.getenv("RC_BOT_TOKEN", "").strip()
     if not token:
         return _ringcentral_tool_error("RC_BOT_TOKEN must be set.")
     owner_creds = _owner_credentials_from({})
     if not owner_creds:
-        return _ringcentral_tool_error(
-            "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
-        )
+        return _ringcentral_tool_error(_OWNER_CREDENTIALS_MISSING_ERROR)
 
     record_count = _history_record_count_from_arg(args.get("record_count"))
     target_type = str(args.get("target_type") or "auto").strip().lower()
@@ -3451,7 +3433,7 @@ async def _ringcentral_get_recent_messages(args: Dict[str, Any], **_: Any) -> st
             or not adapter._owner_person_id
             or not adapter._owner_email
         ):
-            return _ringcentral_tool_error("RingCentral owner authentication failed.")
+            return _ringcentral_tool_error(_OWNER_AUTH_FAILED_ERROR)
 
         session_user_norm = _normalize_email(session_user_id)
         if not (

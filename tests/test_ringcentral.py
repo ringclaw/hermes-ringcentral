@@ -400,6 +400,7 @@ class TestRingCentralClientOAuth:
         client = RingCentralClient("access-token", server_url="https://platform.example.test")
 
         async def fake_request(method, path, **kwargs):
+            await asyncio.sleep(0)
             calls.append((method, path, kwargs))
             if method == "GET" and path.endswith("/notes?recordCount=10"):
                 return {"records": [{"id": "note-1", "title": "Note"}]}
@@ -2278,29 +2279,6 @@ class TestRingCentralHistoryTool:
             for token in reversed(tokens):
                 token.var.reset(token)
 
-    @staticmethod
-    def _call_note_tool(
-        handler,
-        args: dict,
-        *,
-        platform: str = "ringcentral",
-        chat_id: str = "g-1",
-        user_id: str = "owner@example.com",
-    ) -> dict:
-        from gateway.session_context import set_session_vars
-
-        tokens = set_session_vars(
-            platform=platform,
-            chat_id=chat_id,
-            user_id=user_id,
-            user_name="Owner",
-        )
-        try:
-            return json.loads(asyncio.run(handler(args)))
-        finally:
-            for token in reversed(tokens):
-                token.var.reset(token)
-
     def test_history_tool_availability_requires_bot_and_owner_env(self, monkeypatch):
         monkeypatch.delenv("RC_BOT_TOKEN", raising=False)
         monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
@@ -2395,16 +2373,6 @@ class TestRingCentralHistoryTool:
         assert result["success"] is False
         assert "current session chat" in result["error"]
 
-    def test_note_tool_availability_requires_owner_env(self, monkeypatch):
-        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
-        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
-        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
-
-        assert _ringcentral_owner_tool_available() is False
-
-        self._set_owner_env(monkeypatch)
-        assert _ringcentral_owner_tool_available() is True
-
     def test_note_tools_use_owner_current_session(self, monkeypatch):
         self._set_owner_env(monkeypatch)
         owner = MagicMock()
@@ -2422,15 +2390,15 @@ class TestRingCentralHistoryTool:
         owner.publish_note = AsyncMock(return_value=True)
 
         with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
-            listed = self._call_note_tool(_ringcentral_list_notes, {"record_count": 10})
-            created = self._call_note_tool(
+            listed = self._call_calendar_tool(_ringcentral_list_notes, {"record_count": 10})
+            created = self._call_calendar_tool(
                 _ringcentral_create_note,
                 {"title": "Note", "body": "<b>Body</b>", "publish": True},
             )
-            read = self._call_note_tool(_ringcentral_get_note, {"note_id": "n1"})
-            updated = self._call_note_tool(_ringcentral_update_note, {"note_id": "n1", "title": "Updated"})
-            published = self._call_note_tool(_ringcentral_publish_note, {"note_id": "n1"})
-            deleted = self._call_note_tool(_ringcentral_delete_note, {"note_id": "n1"})
+            read = self._call_calendar_tool(_ringcentral_get_note, {"note_id": "n1"})
+            updated = self._call_calendar_tool(_ringcentral_update_note, {"note_id": "n1", "title": "Updated"})
+            published = self._call_calendar_tool(_ringcentral_publish_note, {"note_id": "n1"})
+            deleted = self._call_calendar_tool(_ringcentral_delete_note, {"note_id": "n1"})
 
         assert listed["success"] is True
         assert listed["notes"] == [{"id": "n1", "title": "Note", "status": "Draft"}]
@@ -2461,7 +2429,7 @@ class TestRingCentralHistoryTool:
         owner.close = AsyncMock()
 
         with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
-            result = self._call_note_tool(
+            result = self._call_calendar_tool(
                 _ringcentral_create_note,
                 {"title": "Note"},
                 user_id="alice@example.com",
