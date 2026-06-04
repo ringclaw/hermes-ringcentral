@@ -268,7 +268,7 @@ def read_live_env() -> LiveEnv:
         owner_jwt_token=read_required("RC_USER_JWT_TOKEN"),
         chat_id=read_required("RC_E2E_CHAT_ID"),
         record_count=read_positive_int_env("RC_E2E_RECORD_COUNT", 50, 1, 1000),
-        cleanup=read_bool_env("RC_E2E_CLEANUP", True),
+        cleanup=read_bool_env("RC_E2E_CLEANUP", False),
         ws_timeout_ms=read_positive_int_env("RC_E2E_WS_TIMEOUT_MS", 30_000, 5_000, 120_000),
     )
     if missing:
@@ -291,6 +291,9 @@ def build_base_summary_context() -> Dict[str, Any]:
         "event": os.getenv("GITHUB_EVENT_NAME", "local"),
         "source_present": bool(os.getenv("RC_E2E_SOURCE_URL", "").strip()),
         "commit_present": bool(os.getenv("RC_E2E_COMMIT_SHA", "").strip()),
+        "cleanup": read_bool_env("RC_E2E_CLEANUP", False),
+        "record_count": read_positive_int_env("RC_E2E_RECORD_COUNT", 50, 1, 1000),
+        "ws_timeout_ms": read_positive_int_env("RC_E2E_WS_TIMEOUT_MS", 30_000, 5_000, 120_000),
     }
 
 
