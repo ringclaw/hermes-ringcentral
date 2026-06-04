@@ -743,7 +743,7 @@ def build_unique_text(label: str) -> str:
 def build_adaptive_card(text: str) -> Dict[str, Any]:
     return {
         "type": "AdaptiveCard",
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
         "version": "1.3",
         "body": [{"type": "TextBlock", "text": text, "wrap": True}],
     }
