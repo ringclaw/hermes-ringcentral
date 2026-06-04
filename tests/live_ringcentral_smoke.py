@@ -52,6 +52,7 @@ async def test_ringcentral_live_smoke() -> None:
     created_bot_post_ids: List[str] = []
     created_owner_post_ids: List[str] = []
     created_owner_event_ids: List[str] = []
+    created_bot_adaptive_card_ids: List[str] = []
     created_owner_note_ids: List[str] = []
     ringcentral_logger = logging.getLogger("ringcentral")
     previous_log_level = ringcentral_logger.level
@@ -124,6 +125,11 @@ async def test_ringcentral_live_smoke() -> None:
             owner_client=owner_client,
             created_owner_event_ids=created_owner_event_ids,
         )
+        await run_adaptive_card_scenario(
+            env=env,
+            bot_client=bot_client,
+            created_bot_adaptive_card_ids=created_bot_adaptive_card_ids,
+        )
         await run_note_scenario(
             env=env,
             owner_client=owner_client,
@@ -147,6 +153,11 @@ async def test_ringcentral_live_smoke() -> None:
                     cleanup=env.cleanup,
                     owner_client=owner_client,
                     event_ids=created_owner_event_ids,
+                )
+                await cleanup_adaptive_cards(
+                    cleanup=env.cleanup,
+                    bot_client=bot_client,
+                    adaptive_card_ids=created_bot_adaptive_card_ids,
                 )
                 await cleanup_notes(
                     cleanup=env.cleanup,
@@ -555,6 +566,40 @@ async def run_calendar_event_scenario(
     log_safe("calendar_event_update", updated=True)
 
 
+async def run_adaptive_card_scenario(
+    *,
+    env: LiveEnv,
+    bot_client: RingCentralClient,
+    created_bot_adaptive_card_ids: List[str],
+) -> None:
+    initial_text = build_unique_text("adaptive-card")
+    updated_text = build_unique_text("adaptive-card-updated")
+
+    created = await live_step(
+        "adaptive_card_create",
+        lambda: bot_client.create_adaptive_card(env.chat_id, build_adaptive_card(initial_text)),
+    )
+    assert_live(isinstance(created, dict) and created.get("id"), "adaptive_card_create", bot_client)
+    card_id = str(created["id"])
+    created_bot_adaptive_card_ids.append(card_id)
+    log_safe("adaptive_card_create", created=True)
+
+    read = await live_step("adaptive_card_get", lambda: bot_client.get_adaptive_card(card_id))
+    assert_live(isinstance(read, dict) and str(read.get("id")) == card_id, "adaptive_card_get", bot_client)
+    log_safe("adaptive_card_get", found=True)
+
+    updated = await live_step(
+        "adaptive_card_update",
+        lambda: bot_client.update_adaptive_card(card_id, build_adaptive_card(updated_text)),
+    )
+    assert_live(
+        isinstance(updated, dict) and str(updated.get("id")) == card_id,
+        "adaptive_card_update",
+        bot_client,
+    )
+    log_safe("adaptive_card_update", updated=True)
+
+
 async def run_note_scenario(
     *,
     env: LiveEnv,
@@ -781,6 +826,27 @@ async def cleanup_events(
     log_safe("calendar_event_cleanup", cleanup_events=cleanup_events_ok)
 
 
+async def cleanup_adaptive_cards(
+    *,
+    cleanup: bool,
+    bot_client: RingCentralClient,
+    adaptive_card_ids: List[str],
+) -> None:
+    if not cleanup:
+        log_safe("adaptive_card_cleanup", enabled=False)
+        return
+
+    cleanup_adaptive_cards_ok = True
+    for card_id in reversed(adaptive_card_ids):
+        try:
+            cleanup_adaptive_cards_ok = (
+                bool(await bot_client.delete_adaptive_card(card_id)) and cleanup_adaptive_cards_ok
+            )
+        except Exception:  # noqa: BLE001
+            cleanup_adaptive_cards_ok = False
+    log_safe("adaptive_card_cleanup", cleanup_adaptive_cards=cleanup_adaptive_cards_ok)
+
+
 async def cleanup_notes(
     *,
     cleanup: bool,
@@ -826,6 +892,15 @@ def build_calendar_event_payload(label: str) -> Dict[str, Any]:
         "startTime": iso_timestamp(start_time),
         "endTime": iso_timestamp(end_time),
         "description": build_unique_text(f"{label}-description"),
+    }
+
+
+def build_adaptive_card(text: str) -> Dict[str, Any]:
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.3",
+        "body": [{"type": "TextBlock", "text": text, "wrap": True}],
     }
 
 

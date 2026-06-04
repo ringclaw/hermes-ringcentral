@@ -147,12 +147,6 @@ _RINGCENTRAL_CREATE_EVENT_TOOL_NAME = "ringcentral_create_calendar_event"
 _RINGCENTRAL_GET_EVENT_TOOL_NAME = "ringcentral_get_calendar_event"
 _RINGCENTRAL_UPDATE_EVENT_TOOL_NAME = "ringcentral_update_calendar_event"
 _RINGCENTRAL_DELETE_EVENT_TOOL_NAME = "ringcentral_delete_calendar_event"
-_RINGCENTRAL_LIST_NOTES_TOOL_NAME = "ringcentral_list_notes"
-_RINGCENTRAL_CREATE_NOTE_TOOL_NAME = "ringcentral_create_note"
-_RINGCENTRAL_GET_NOTE_TOOL_NAME = "ringcentral_get_note"
-_RINGCENTRAL_UPDATE_NOTE_TOOL_NAME = "ringcentral_update_note"
-_RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
-_RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
 
 _EVENT_WRITE_PROPERTIES = {
     "title": {"type": "string", "description": "Calendar event title."},
@@ -229,6 +223,81 @@ _RINGCENTRAL_DELETE_EVENT_SCHEMA = {
             "event_id": {"type": "string", "description": "RingCentral calendar event ID."},
         },
         "required": ["event_id"],
+    },
+}
+
+_RINGCENTRAL_CREATE_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_create_adaptive_card"
+_RINGCENTRAL_GET_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_get_adaptive_card"
+_RINGCENTRAL_UPDATE_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_update_adaptive_card"
+_RINGCENTRAL_DELETE_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_delete_adaptive_card"
+_RINGCENTRAL_LIST_NOTES_TOOL_NAME = "ringcentral_list_notes"
+_RINGCENTRAL_CREATE_NOTE_TOOL_NAME = "ringcentral_create_note"
+_RINGCENTRAL_GET_NOTE_TOOL_NAME = "ringcentral_get_note"
+_RINGCENTRAL_UPDATE_NOTE_TOOL_NAME = "ringcentral_update_note"
+_RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
+_RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
+
+_ADAPTIVE_CARD_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "chat_id": {
+            "type": "string",
+            "description": (
+                "RingCentral chat ID. Defaults to the current RingCentral session chat; "
+                "when provided it must match the current session chat."
+            ),
+        },
+        "card": {
+            "type": "object",
+            "description": "Full Adaptive Card JSON payload. The type is forced to AdaptiveCard.",
+        },
+        "text": {
+            "type": "string",
+            "description": "Fallback plain text used to build a minimal TextBlock card.",
+        },
+    },
+}
+
+_RINGCENTRAL_CREATE_ADAPTIVE_CARD_SCHEMA = {
+    "name": _RINGCENTRAL_CREATE_ADAPTIVE_CARD_TOOL_NAME,
+    "description": "Create an Adaptive Card in the current RingCentral chat.",
+    "parameters": _ADAPTIVE_CARD_PARAMETERS,
+}
+
+_RINGCENTRAL_GET_ADAPTIVE_CARD_SCHEMA = {
+    "name": _RINGCENTRAL_GET_ADAPTIVE_CARD_TOOL_NAME,
+    "description": "Read a RingCentral Adaptive Card by card ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "card_id": {"type": "string", "description": "Adaptive Card ID."},
+        },
+        "required": ["card_id"],
+    },
+}
+
+_RINGCENTRAL_UPDATE_ADAPTIVE_CARD_SCHEMA = {
+    "name": _RINGCENTRAL_UPDATE_ADAPTIVE_CARD_TOOL_NAME,
+    "description": "Replace an existing RingCentral Adaptive Card.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "card_id": {"type": "string", "description": "Adaptive Card ID."},
+            **_ADAPTIVE_CARD_PARAMETERS["properties"],
+        },
+        "required": ["card_id"],
+    },
+}
+
+_RINGCENTRAL_DELETE_ADAPTIVE_CARD_SCHEMA = {
+    "name": _RINGCENTRAL_DELETE_ADAPTIVE_CARD_TOOL_NAME,
+    "description": "Delete a RingCentral Adaptive Card by card ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "card_id": {"type": "string", "description": "Adaptive Card ID."},
+        },
+        "required": ["card_id"],
     },
 }
 
@@ -2792,6 +2861,10 @@ def _ringcentral_owner_tool_available() -> bool:
     return bool(_owner_credentials_from({}))
 
 
+def _ringcentral_bot_tool_available() -> bool:
+    return bool(os.getenv("RC_BOT_TOKEN", "").strip())
+
+
 def _history_record_count_from_arg(raw: Any) -> int:
     if raw in (None, ""):
         return _history_message_limit_from({})
@@ -2805,6 +2878,44 @@ def _session_env(name: str, default: str = "") -> str:
         return get_session_env(name, default)
     except Exception:
         return os.getenv(name, default)
+
+
+def _require_ringcentral_session() -> tuple[Optional[str], Optional[str]]:
+    platform = _session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    if platform != "ringcentral":
+        return None, "RingCentral artifact tools can only be used from a RingCentral session."
+    session_chat_id = _session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    if not session_chat_id:
+        return None, "RingCentral session chat_id is missing."
+    return session_chat_id, None
+
+
+def _resolve_session_chat_arg(args: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    session_chat_id, error = _require_ringcentral_session()
+    if error:
+        return None, error
+    requested_chat_id = str(args.get("chat_id") or "").strip()
+    if requested_chat_id and requested_chat_id != session_chat_id:
+        return None, "RingCentral artifact tools can only target the current session chat."
+    return session_chat_id, None
+
+
+def _adaptive_card_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    raw_card = args.get("card")
+    if isinstance(raw_card, dict):
+        payload = dict(raw_card)
+    else:
+        text = str(args.get("text") or "RingCentral Adaptive Card")
+        payload = {
+            "version": "1.3",
+            "body": [{"type": "TextBlock", "text": text, "wrap": True}],
+        }
+    payload["type"] = "AdaptiveCard"
+    return payload
+
+
+def _artifact_server_url() -> str:
+    return os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL
 
 
 def _note_record_count_from_arg(raw: Any) -> int:
@@ -3054,6 +3165,97 @@ async def _ringcentral_delete_calendar_event(args: Dict[str, Any], **_: Any) -> 
     try:
         deleted = await client.delete_event(event_id)
         return _ringcentral_tool_json({"success": bool(deleted), "event_id": event_id})
+    finally:
+        await client.close()
+
+
+async def _ringcentral_create_adaptive_card(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    chat_id, error = _resolve_session_chat_arg(args)
+    if error:
+        return _ringcentral_tool_error(error)
+    token = os.getenv("RC_BOT_TOKEN", "").strip()
+    if not token:
+        return _ringcentral_tool_error("RC_BOT_TOKEN must be set.")
+
+    client = RingCentralClient(token, _artifact_server_url())
+    try:
+        card = await client.create_adaptive_card(chat_id or "", _adaptive_card_payload(args))
+        if not isinstance(card, dict) or not card.get("id"):
+            return _ringcentral_tool_error("RingCentral Adaptive Card create failed.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "card_id": str(card.get("id")),
+            "type": str(card.get("type") or "AdaptiveCard"),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_get_adaptive_card(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    _, error = _require_ringcentral_session()
+    if error:
+        return _ringcentral_tool_error(error)
+    card_id = str(args.get("card_id") or args.get("id") or "").strip()
+    if not card_id:
+        return _ringcentral_tool_error("card_id is required.")
+    token = os.getenv("RC_BOT_TOKEN", "").strip()
+    if not token:
+        return _ringcentral_tool_error("RC_BOT_TOKEN must be set.")
+
+    client = RingCentralClient(token, _artifact_server_url())
+    try:
+        card = await client.get_adaptive_card(card_id)
+        if not isinstance(card, dict) or not card.get("id"):
+            return _ringcentral_tool_error("RingCentral Adaptive Card read failed.")
+        return _ringcentral_tool_json({"success": True, "card": card})
+    finally:
+        await client.close()
+
+
+async def _ringcentral_update_adaptive_card(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    _, error = _resolve_session_chat_arg(args)
+    if error:
+        return _ringcentral_tool_error(error)
+    card_id = str(args.get("card_id") or args.get("id") or "").strip()
+    if not card_id:
+        return _ringcentral_tool_error("card_id is required.")
+    token = os.getenv("RC_BOT_TOKEN", "").strip()
+    if not token:
+        return _ringcentral_tool_error("RC_BOT_TOKEN must be set.")
+
+    client = RingCentralClient(token, _artifact_server_url())
+    try:
+        card = await client.update_adaptive_card(card_id, _adaptive_card_payload(args))
+        if not isinstance(card, dict) or not card.get("id"):
+            return _ringcentral_tool_error("RingCentral Adaptive Card update failed.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "card_id": str(card.get("id")),
+            "type": str(card.get("type") or "AdaptiveCard"),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_delete_adaptive_card(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    _, error = _require_ringcentral_session()
+    if error:
+        return _ringcentral_tool_error(error)
+    card_id = str(args.get("card_id") or args.get("id") or "").strip()
+    if not card_id:
+        return _ringcentral_tool_error("card_id is required.")
+    token = os.getenv("RC_BOT_TOKEN", "").strip()
+    if not token:
+        return _ringcentral_tool_error("RC_BOT_TOKEN must be set.")
+
+    client = RingCentralClient(token, _artifact_server_url())
+    try:
+        deleted = await client.delete_adaptive_card(card_id)
+        return _ringcentral_tool_json({"success": bool(deleted), "deleted": bool(deleted)})
     finally:
         await client.close()
 
@@ -3647,6 +3849,42 @@ def register(ctx) -> None:
         check_fn=_ringcentral_owner_tool_available,
         is_async=True,
         emoji="📅",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_CREATE_ADAPTIVE_CARD_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_CREATE_ADAPTIVE_CARD_SCHEMA,
+        handler=_ringcentral_create_adaptive_card,
+        check_fn=_ringcentral_bot_tool_available,
+        is_async=True,
+        emoji="🧩",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_GET_ADAPTIVE_CARD_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_GET_ADAPTIVE_CARD_SCHEMA,
+        handler=_ringcentral_get_adaptive_card,
+        check_fn=_ringcentral_bot_tool_available,
+        is_async=True,
+        emoji="🧩",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_UPDATE_ADAPTIVE_CARD_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_UPDATE_ADAPTIVE_CARD_SCHEMA,
+        handler=_ringcentral_update_adaptive_card,
+        check_fn=_ringcentral_bot_tool_available,
+        is_async=True,
+        emoji="🧩",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_DELETE_ADAPTIVE_CARD_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_DELETE_ADAPTIVE_CARD_SCHEMA,
+        handler=_ringcentral_delete_adaptive_card,
+        check_fn=_ringcentral_bot_tool_available,
+        is_async=True,
+        emoji="🧩",
     )
     ctx.register_tool(
         name=_RINGCENTRAL_LIST_NOTES_TOOL_NAME,

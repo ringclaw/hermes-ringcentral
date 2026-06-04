@@ -21,6 +21,10 @@ Endpoints covered:
 * ``GET    /team-messaging/v1/events/{eventID}``              — read calendar event
 * ``PUT    /team-messaging/v1/events/{eventID}``              — update calendar event
 * ``DELETE /team-messaging/v1/events/{eventID}``              — delete calendar event
+* ``POST   /team-messaging/v1/chats/{chatID}/adaptive-cards`` — create Adaptive Card
+* ``GET    /team-messaging/v1/adaptive-cards/{cardID}``       — read Adaptive Card
+* ``PUT    /team-messaging/v1/adaptive-cards/{cardID}``       — update Adaptive Card
+* ``DELETE /team-messaging/v1/adaptive-cards/{cardID}``       — delete Adaptive Card
 * ``GET    /team-messaging/v1/chats/{chatID}/notes``          — list notes
 * ``POST   /team-messaging/v1/chats/{chatID}/notes``          — create note
 * ``GET    /team-messaging/v1/notes/{noteID}``                — read note
@@ -527,6 +531,62 @@ class RingCentralClient:
         result = await self._request(
             "DELETE",
             f"/team-messaging/v1/events/{quote(event_id, safe='')}",
+            expect_json=False,
+        )
+        return result is not None
+
+    # ------------------------------------------------------------------
+    # Adaptive Cards
+    # ------------------------------------------------------------------
+
+    async def create_adaptive_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create an Adaptive Card in a RingCentral chat."""
+        if not chat_id:
+            return None
+        payload = dict(card or {})
+        payload["type"] = "AdaptiveCard"
+        return await self._request(
+            "POST",
+            f"/team-messaging/v1/chats/{quote(chat_id, safe='')}/adaptive-cards",
+            json_body=payload,
+        )
+
+    async def get_adaptive_card(self, card_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one Adaptive Card by ID."""
+        if not card_id:
+            return None
+        return await self._request(
+            "GET",
+            f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
+        )
+
+    async def update_adaptive_card(
+        self,
+        card_id: str,
+        card: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Replace an Adaptive Card by ID."""
+        if not card_id:
+            return None
+        payload = dict(card or {})
+        payload["type"] = "AdaptiveCard"
+        return await self._request(
+            "PUT",
+            f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
+            json_body=payload,
+        )
+
+    async def delete_adaptive_card(self, card_id: str) -> bool:
+        """Delete an Adaptive Card by ID. Returns True on success."""
+        if not card_id:
+            return False
+        result = await self._request(
+            "DELETE",
+            f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
             expect_json=False,
         )
         return result is not None
