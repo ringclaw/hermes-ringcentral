@@ -38,13 +38,19 @@ from ringcentral.adapter import (  # noqa: E402
     _no_thread_channels,
     _normalize_allowed_user_emails_env,
     _require_mention,
-    _ringcentral_get_recent_messages,
-    _ringcentral_create_adaptive_card,
-    _ringcentral_get_adaptive_card,
-    _ringcentral_update_adaptive_card,
-    _ringcentral_delete_adaptive_card,
-    _ringcentral_history_tool_available,
     _ringcentral_bot_tool_available,
+    _ringcentral_create_adaptive_card,
+    _ringcentral_create_calendar_event,
+    _ringcentral_delete_adaptive_card,
+    _ringcentral_delete_calendar_event,
+    _ringcentral_get_adaptive_card,
+    _ringcentral_get_calendar_event,
+    _ringcentral_get_recent_messages,
+    _ringcentral_history_tool_available,
+    _ringcentral_list_calendar_events,
+    _ringcentral_owner_tool_available,
+    _ringcentral_update_adaptive_card,
+    _ringcentral_update_calendar_event,
     _RINGCENTRAL_HISTORY_TOOL_NAME,
     _standalone_send,
     _thread_require_mention,
@@ -254,56 +260,6 @@ class TestRingCentralClientOAuth:
             )
         ]
 
-    def test_adaptive_card_methods_use_verified_endpoints(self):
-        calls = []
-        client = RingCentralClient("access-token", server_url="https://platform.example.test")
-
-        async def fake_request(method, path, **kwargs):
-            calls.append((method, path, kwargs))
-            if method == "DELETE":
-                return b""
-            return {"id": "card-1", "type": "AdaptiveCard"}
-
-        client._request = fake_request
-
-        created = asyncio.run(
-            client.create_adaptive_card(
-                "g-1",
-                {"type": "Wrong", "version": "1.3", "body": []},
-            )
-        )
-        read = asyncio.run(client.get_adaptive_card("card-1"))
-        updated = asyncio.run(
-            client.update_adaptive_card(
-                "card-1",
-                {"version": "1.3", "body": []},
-            )
-        )
-        deleted = asyncio.run(client.delete_adaptive_card("card-1"))
-
-        assert created == {"id": "card-1", "type": "AdaptiveCard"}
-        assert read == {"id": "card-1", "type": "AdaptiveCard"}
-        assert updated == {"id": "card-1", "type": "AdaptiveCard"}
-        assert deleted is True
-        assert calls == [
-            (
-                "POST",
-                "/team-messaging/v1/chats/g-1/adaptive-cards",
-                {"json_body": {"type": "AdaptiveCard", "version": "1.3", "body": []}},
-            ),
-            ("GET", "/team-messaging/v1/adaptive-cards/card-1", {}),
-            (
-                "PUT",
-                "/team-messaging/v1/adaptive-cards/card-1",
-                {"json_body": {"version": "1.3", "body": [], "type": "AdaptiveCard"}},
-            ),
-            (
-                "DELETE",
-                "/team-messaging/v1/adaptive-cards/card-1",
-                {"expect_json": False},
-            ),
-        ]
-
     def test_search_directory_posts_search_string(self):
         calls = []
         client = RingCentralClient("access-token", server_url="https://platform.example.test")
@@ -322,6 +278,116 @@ class TestRingCentralClientOAuth:
             "/restapi/v1.0/account/~/directory/entries/search",
             {"json_body": {"searchString": "Alice"}},
         )]
+
+    def test_calendar_event_methods_use_verified_endpoints(self):
+        calls = []
+        client = RingCentralClient("access-token", server_url="https://platform.example.test")
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if method == "GET" and path.endswith("/events?recordCount=10"):
+                return {"records": [{"id": "event-1", "title": "Planning"}]}
+            if method == "DELETE":
+                return b""
+            return {"id": "event-1", "title": "Planning"}
+
+        client._request = fake_request
+
+        events = asyncio.run(client.list_events("g-1", 10))
+        created = asyncio.run(client.create_event("g-1", {
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        }))
+        read = asyncio.run(client.get_event("event-1"))
+        updated = asyncio.run(client.update_event("event-1", {
+            "title": "Updated",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        }))
+        deleted = asyncio.run(client.delete_event("event-1"))
+
+        assert events == [{"id": "event-1", "title": "Planning"}]
+        assert created == {"id": "event-1", "title": "Planning"}
+        assert read == {"id": "event-1", "title": "Planning"}
+        assert updated == {"id": "event-1", "title": "Planning"}
+        assert deleted is True
+        assert calls == [
+            ("GET", "/team-messaging/v1/groups/g-1/events?recordCount=10", {}),
+            (
+                "POST",
+                "/team-messaging/v1/groups/g-1/events",
+                {
+                    "json_body": {
+                        "title": "Planning",
+                        "startTime": "2026-06-04T10:00:00Z",
+                        "endTime": "2026-06-04T11:00:00Z",
+                    },
+                },
+            ),
+            ("GET", "/team-messaging/v1/events/event-1", {}),
+            (
+                "PUT",
+                "/team-messaging/v1/events/event-1",
+                {
+                    "json_body": {
+                        "title": "Updated",
+                        "startTime": "2026-06-04T10:00:00Z",
+                        "endTime": "2026-06-04T11:00:00Z",
+                    },
+                },
+            ),
+            ("DELETE", "/team-messaging/v1/events/event-1", {"expect_json": False}),
+        ]
+
+    def test_adaptive_card_methods_use_verified_endpoints(self):
+        calls = []
+        client = RingCentralClient("access-token", server_url="https://platform.example.test")
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if method == "DELETE":
+                return b""
+            return {"id": "card-1", "type": "AdaptiveCard"}
+
+        client._request = fake_request
+
+        card = {"version": "1.3", "body": [{"type": "TextBlock", "text": "hello"}]}
+        created = asyncio.run(client.create_adaptive_card("g-1", card))
+        read = asyncio.run(client.get_adaptive_card("card-1"))
+        updated = asyncio.run(client.update_adaptive_card("card-1", card))
+        deleted = asyncio.run(client.delete_adaptive_card("card-1"))
+
+        assert created == {"id": "card-1", "type": "AdaptiveCard"}
+        assert read == {"id": "card-1", "type": "AdaptiveCard"}
+        assert updated == {"id": "card-1", "type": "AdaptiveCard"}
+        assert deleted is True
+        assert calls == [
+            (
+                "POST",
+                "/team-messaging/v1/chats/g-1/adaptive-cards",
+                {
+                    "json_body": {
+                        "version": "1.3",
+                        "body": [{"type": "TextBlock", "text": "hello"}],
+                        "type": "AdaptiveCard",
+                    },
+                },
+            ),
+            ("GET", "/team-messaging/v1/adaptive-cards/card-1", {}),
+            (
+                "PUT",
+                "/team-messaging/v1/adaptive-cards/card-1",
+                {
+                    "json_body": {
+                        "version": "1.3",
+                        "body": [{"type": "TextBlock", "text": "hello"}],
+                        "type": "AdaptiveCard",
+                    },
+                },
+            ),
+            ("DELETE", "/team-messaging/v1/adaptive-cards/card-1", {"expect_json": False}),
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -2101,8 +2167,43 @@ class TestRingCentralHistoryTool:
             for token in reversed(tokens):
                 token.var.reset(token)
 
+    def _call_tool_with_clients(self, monkeypatch, bot, owner, args, **session):
+        self._set_owner_env(monkeypatch)
+        with patch.object(_rc_mod, "RingCentralClient", return_value=bot) as client_cls:
+            client_cls.from_jwt.return_value = owner
+            return self._call_tool(args, **session)
+
     @staticmethod
-    def _call_artifact_tool(handler, args: dict, *, platform: str = "ringcentral", chat_id: str = "g-1") -> dict:
+    def _call_calendar_tool(
+        handler,
+        args: dict,
+        *,
+        platform: str = "ringcentral",
+        chat_id: str = "g-1",
+        user_id: str = "owner@example.com",
+    ) -> dict:
+        from gateway.session_context import set_session_vars
+
+        tokens = set_session_vars(
+            platform=platform,
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name="Owner",
+        )
+        try:
+            return json.loads(asyncio.run(handler(args)))
+        finally:
+            for token in reversed(tokens):
+                token.var.reset(token)
+
+    @staticmethod
+    def _call_artifact_tool(
+        handler,
+        args: dict,
+        *,
+        platform: str = "ringcentral",
+        chat_id: str = "g-1",
+    ) -> dict:
         from gateway.session_context import set_session_vars
 
         tokens = set_session_vars(
@@ -2117,12 +2218,6 @@ class TestRingCentralHistoryTool:
             for token in reversed(tokens):
                 token.var.reset(token)
 
-    def _call_tool_with_clients(self, monkeypatch, bot, owner, args, **session):
-        self._set_owner_env(monkeypatch)
-        with patch.object(_rc_mod, "RingCentralClient", return_value=bot) as client_cls:
-            client_cls.from_jwt.return_value = owner
-            return self._call_tool(args, **session)
-
     def test_history_tool_availability_requires_bot_and_owner_env(self, monkeypatch):
         monkeypatch.delenv("RC_BOT_TOKEN", raising=False)
         monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
@@ -2134,8 +2229,22 @@ class TestRingCentralHistoryTool:
         self._set_owner_env(monkeypatch)
         assert _ringcentral_history_tool_available() is True
 
+    def test_calendar_event_tool_availability_requires_owner_env(self, monkeypatch):
+        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
+
+        assert _ringcentral_owner_tool_available() is False
+
+        self._set_owner_env(monkeypatch)
+        assert _ringcentral_owner_tool_available() is True
+
     def test_adaptive_card_tool_availability_requires_bot_token(self, monkeypatch):
         monkeypatch.delenv("RC_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
+
         assert _ringcentral_bot_tool_available() is False
 
         monkeypatch.setenv("RC_BOT_TOKEN", "bot-token")
@@ -2143,72 +2252,168 @@ class TestRingCentralHistoryTool:
 
     def test_adaptive_card_tools_use_current_ringcentral_session(self, monkeypatch):
         monkeypatch.setenv("RC_BOT_TOKEN", "bot-token")
-        client = MagicMock()
-        client.create_adaptive_card = AsyncMock(return_value={"id": "card-1", "type": "AdaptiveCard"})
-        client.get_adaptive_card = AsyncMock(return_value={"id": "card-1", "type": "AdaptiveCard"})
-        client.update_adaptive_card = AsyncMock(return_value={"id": "card-1", "type": "AdaptiveCard"})
-        client.delete_adaptive_card = AsyncMock(return_value=True)
-        client.close = AsyncMock()
+        bot = MagicMock()
+        bot.create_adaptive_card = AsyncMock(return_value={"id": "card-1", "type": "AdaptiveCard"})
+        bot.get_adaptive_card = AsyncMock(return_value={"id": "card-1", "type": "AdaptiveCard"})
+        bot.update_adaptive_card = AsyncMock(return_value={"id": "card-1", "type": "AdaptiveCard"})
+        bot.delete_adaptive_card = AsyncMock(return_value=True)
+        bot.close = AsyncMock()
 
-        with patch.object(_rc_mod, "RingCentralClient", return_value=client):
+        with patch.object(_rc_mod, "RingCentralClient", return_value=bot):
             created = self._call_artifact_tool(
                 _ringcentral_create_adaptive_card,
-                {"text": "hello card"},
-                chat_id="g-1",
+                {"text": "hello"},
             )
-            read = self._call_artifact_tool(
-                _ringcentral_get_adaptive_card,
-                {"card_id": "card-1"},
-                chat_id="g-1",
-            )
+            read = self._call_artifact_tool(_ringcentral_get_adaptive_card, {"card_id": "card-1"})
             updated = self._call_artifact_tool(
                 _ringcentral_update_adaptive_card,
-                {"card_id": "card-1", "card": {"type": "Wrong", "body": []}},
-                chat_id="g-1",
+                {"card_id": "card-1", "text": "updated"},
             )
-            deleted = self._call_artifact_tool(
-                _ringcentral_delete_adaptive_card,
-                {"card_id": "card-1"},
-                chat_id="g-1",
-            )
+            deleted = self._call_artifact_tool(_ringcentral_delete_adaptive_card, {"card_id": "card-1"})
 
         assert created == {"success": True, "card_id": "card-1", "type": "AdaptiveCard"}
         assert read == {"success": True, "card": {"id": "card-1", "type": "AdaptiveCard"}}
         assert updated == {"success": True, "card_id": "card-1", "type": "AdaptiveCard"}
         assert deleted == {"success": True, "deleted": True}
-        client.create_adaptive_card.assert_awaited_once_with(
-            "g-1",
-            {
-                "version": "1.3",
-                "body": [{"type": "TextBlock", "text": "hello card", "wrap": True}],
-                "type": "AdaptiveCard",
-            },
-        )
-        client.update_adaptive_card.assert_awaited_once_with(
-            "card-1",
-            {"type": "AdaptiveCard", "body": []},
-        )
-        assert client.close.await_count == 4
+        bot.create_adaptive_card.assert_awaited_once_with("g-1", {
+            "version": "1.3",
+            "body": [{"type": "TextBlock", "text": "hello", "wrap": True}],
+            "type": "AdaptiveCard",
+        })
+        bot.get_adaptive_card.assert_awaited_once_with("card-1")
+        bot.update_adaptive_card.assert_awaited_once_with("card-1", {
+            "version": "1.3",
+            "body": [{"type": "TextBlock", "text": "updated", "wrap": True}],
+            "type": "AdaptiveCard",
+        })
+        bot.delete_adaptive_card.assert_awaited_once_with("card-1")
+        assert bot.close.await_count == 4
 
     def test_adaptive_card_tool_rejects_non_ringcentral_session(self, monkeypatch):
         monkeypatch.setenv("RC_BOT_TOKEN", "bot-token")
+
         result = self._call_artifact_tool(
             _ringcentral_create_adaptive_card,
             {"text": "hello"},
-            platform="slack",
+            platform="discord",
         )
+
         assert result["success"] is False
         assert "RingCentral session" in result["error"]
 
     def test_adaptive_card_tool_rejects_cross_chat_target(self, monkeypatch):
         monkeypatch.setenv("RC_BOT_TOKEN", "bot-token")
+
         result = self._call_artifact_tool(
             _ringcentral_create_adaptive_card,
-            {"chat_id": "other-chat", "text": "hello"},
-            chat_id="g-1",
+            {"chat_id": "g-2", "text": "hello"},
         )
+
         assert result["success"] is False
         assert "current session chat" in result["error"]
+
+    def test_calendar_event_tools_use_owner_current_session(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        owner = MagicMock()
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+        owner.list_events = AsyncMock(return_value=[{
+            "id": "event-1",
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        }])
+        owner.create_event = AsyncMock(return_value={
+            "id": "event-1",
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        })
+        owner.get_event = AsyncMock(return_value={"id": "event-1", "title": "Planning"})
+        owner.update_event = AsyncMock(return_value={
+            "id": "event-1",
+            "title": "Updated",
+            "startTime": "2026-06-04T12:00:00Z",
+            "endTime": "2026-06-04T13:00:00Z",
+        })
+        owner.delete_event = AsyncMock(return_value=True)
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            listed = self._call_calendar_tool(_ringcentral_list_calendar_events, {"record_count": 10})
+            created = self._call_calendar_tool(
+                _ringcentral_create_calendar_event,
+                {
+                    "title": "Planning",
+                    "start_time": "2026-06-04T10:00:00Z",
+                    "end_time": "2026-06-04T11:00:00Z",
+                    "description": "Agenda",
+                },
+            )
+            read = self._call_calendar_tool(_ringcentral_get_calendar_event, {"event_id": "event-1"})
+            updated = self._call_calendar_tool(
+                _ringcentral_update_calendar_event,
+                {
+                    "event_id": "event-1",
+                    "title": "Updated",
+                    "start_time": "2026-06-04T12:00:00Z",
+                    "end_time": "2026-06-04T13:00:00Z",
+                },
+            )
+            deleted = self._call_calendar_tool(_ringcentral_delete_calendar_event, {"event_id": "event-1"})
+
+        assert listed["events"] == [{
+            "id": "event-1",
+            "title": "Planning",
+            "start_time": "2026-06-04T10:00:00Z",
+            "end_time": "2026-06-04T11:00:00Z",
+        }]
+        assert created["event_id"] == "event-1"
+        assert read["event"]["id"] == "event-1"
+        assert updated["event"]["title"] == "Updated"
+        assert deleted == {"success": True, "event_id": "event-1"}
+        owner.list_events.assert_awaited_once_with("g-1", 10)
+        owner.create_event.assert_awaited_once_with("g-1", {
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+            "description": "Agenda",
+        })
+        owner.get_event.assert_awaited_once_with("event-1")
+        owner.update_event.assert_awaited_once_with("event-1", {
+            "title": "Updated",
+            "startTime": "2026-06-04T12:00:00Z",
+            "endTime": "2026-06-04T13:00:00Z",
+        })
+        owner.delete_event.assert_awaited_once_with("event-1")
+        assert owner.close.await_count == 5
+
+    def test_calendar_event_tool_rejects_non_owner_session_user(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        owner = MagicMock()
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+        owner.create_event = AsyncMock()
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            result = self._call_calendar_tool(
+                _ringcentral_create_calendar_event,
+                {
+                    "title": "Planning",
+                    "start_time": "2026-06-04T10:00:00Z",
+                    "end_time": "2026-06-04T11:00:00Z",
+                },
+                user_id="alice@example.com",
+            )
+
+        assert result["success"] is False
+        assert "Only the configured RingCentral owner" in result["error"]
+        owner.create_event.assert_not_called()
 
     def test_owner_dm_tool_fetches_group_history(self, monkeypatch):
         bot, owner = self._clients()
