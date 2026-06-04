@@ -25,6 +25,12 @@ Endpoints covered:
 * ``GET    /team-messaging/v1/adaptive-cards/{cardID}``       — read Adaptive Card
 * ``PUT    /team-messaging/v1/adaptive-cards/{cardID}``       — update Adaptive Card
 * ``DELETE /team-messaging/v1/adaptive-cards/{cardID}``       — delete Adaptive Card
+* ``GET    /team-messaging/v1/chats/{chatID}/notes``          — list notes
+* ``POST   /team-messaging/v1/chats/{chatID}/notes``          — create note
+* ``GET    /team-messaging/v1/notes/{noteID}``                — read note
+* ``PATCH  /team-messaging/v1/notes/{noteID}``                — update note
+* ``DELETE /team-messaging/v1/notes/{noteID}``                — delete note
+* ``POST   /team-messaging/v1/notes/{noteID}/publish``        — publish note
 * ``GET    /restapi/v1.0/account/~/extension/~``              — own extension
 * ``POST   /team-messaging/v1/conversations``                 — create/find DM
 * ``POST   /restapi/oauth/wstoken``                            — WebSocket token
@@ -581,6 +587,85 @@ class RingCentralClient:
         result = await self._request(
             "DELETE",
             f"/team-messaging/v1/adaptive-cards/{quote(card_id, safe='')}",
+            expect_json=False,
+        )
+        return result is not None
+
+    # ------------------------------------------------------------------
+    # Notes
+    # ------------------------------------------------------------------
+
+    async def list_notes(
+        self,
+        chat_id: str,
+        record_count: int = 50,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """List notes in a RingCentral chat."""
+        if not chat_id:
+            return None
+        data = await self._request(
+            "GET",
+            f"/team-messaging/v1/chats/{quote(chat_id, safe='')}/notes?recordCount={int(record_count)}",
+        )
+        if not data:
+            return None
+        return data.get("records", []) if isinstance(data, dict) else None
+
+    async def create_note(
+        self,
+        chat_id: str,
+        note: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create a draft note in a RingCentral chat."""
+        if not chat_id:
+            return None
+        return await self._request(
+            "POST",
+            f"/team-messaging/v1/chats/{quote(chat_id, safe='')}/notes",
+            json_body=dict(note or {}),
+        )
+
+    async def get_note(self, note_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one note by ID."""
+        if not note_id:
+            return None
+        return await self._request(
+            "GET",
+            f"/team-messaging/v1/notes/{quote(note_id, safe='')}",
+        )
+
+    async def update_note(
+        self,
+        note_id: str,
+        updates: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Patch an existing note."""
+        if not note_id:
+            return None
+        return await self._request(
+            "PATCH",
+            f"/team-messaging/v1/notes/{quote(note_id, safe='')}",
+            json_body=dict(updates or {}),
+        )
+
+    async def delete_note(self, note_id: str) -> bool:
+        """Delete a note. Returns True on success."""
+        if not note_id:
+            return False
+        result = await self._request(
+            "DELETE",
+            f"/team-messaging/v1/notes/{quote(note_id, safe='')}",
+            expect_json=False,
+        )
+        return result is not None
+
+    async def publish_note(self, note_id: str) -> bool:
+        """Publish a draft note. Returns True on success."""
+        if not note_id:
+            return False
+        result = await self._request(
+            "POST",
+            f"/team-messaging/v1/notes/{quote(note_id, safe='')}/publish",
             expect_json=False,
         )
         return result is not None

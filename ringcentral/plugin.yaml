@@ -12,6 +12,12 @@ provides_tools:
   - ringcentral_get_adaptive_card
   - ringcentral_update_adaptive_card
   - ringcentral_delete_adaptive_card
+  - ringcentral_list_notes
+  - ringcentral_create_note
+  - ringcentral_get_note
+  - ringcentral_update_note
+  - ringcentral_delete_note
+  - ringcentral_publish_note
 version: 1.0.0
 description: >
   RingCentral Team Messaging gateway adapter for Hermes Agent.

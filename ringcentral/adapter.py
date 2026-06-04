@@ -230,6 +230,12 @@ _RINGCENTRAL_CREATE_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_create_adaptive_card"
 _RINGCENTRAL_GET_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_get_adaptive_card"
 _RINGCENTRAL_UPDATE_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_update_adaptive_card"
 _RINGCENTRAL_DELETE_ADAPTIVE_CARD_TOOL_NAME = "ringcentral_delete_adaptive_card"
+_RINGCENTRAL_LIST_NOTES_TOOL_NAME = "ringcentral_list_notes"
+_RINGCENTRAL_CREATE_NOTE_TOOL_NAME = "ringcentral_create_note"
+_RINGCENTRAL_GET_NOTE_TOOL_NAME = "ringcentral_get_note"
+_RINGCENTRAL_UPDATE_NOTE_TOOL_NAME = "ringcentral_update_note"
+_RINGCENTRAL_DELETE_NOTE_TOOL_NAME = "ringcentral_delete_note"
+_RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME = "ringcentral_publish_note"
 
 _ADAPTIVE_CARD_PARAMETERS = {
     "type": "object",
@@ -292,6 +298,92 @@ _RINGCENTRAL_DELETE_ADAPTIVE_CARD_SCHEMA = {
             "card_id": {"type": "string", "description": "Adaptive Card ID."},
         },
         "required": ["card_id"],
+    },
+}
+
+_RINGCENTRAL_LIST_NOTES_SCHEMA = {
+    "name": _RINGCENTRAL_LIST_NOTES_TOOL_NAME,
+    "description": "List RingCentral notes in the current chat. Owner credentials are required.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "record_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "How many notes to fetch. Defaults to 50.",
+            },
+        },
+    },
+}
+
+_NOTE_WRITE_PROPERTIES = {
+    "title": {"type": "string", "description": "Note title."},
+    "body": {"type": "string", "description": "Note HTML body."},
+}
+
+_RINGCENTRAL_CREATE_NOTE_SCHEMA = {
+    "name": _RINGCENTRAL_CREATE_NOTE_TOOL_NAME,
+    "description": "Create a draft RingCentral note in the current chat. Set publish=true to publish it immediately.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            **_NOTE_WRITE_PROPERTIES,
+            "publish": {
+                "type": "boolean",
+                "description": "Publish the note after creation. Defaults to false.",
+            },
+        },
+        "required": ["title"],
+    },
+}
+
+_RINGCENTRAL_GET_NOTE_SCHEMA = {
+    "name": _RINGCENTRAL_GET_NOTE_TOOL_NAME,
+    "description": "Read a RingCentral note by note ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "note_id": {"type": "string", "description": "RingCentral note ID."},
+        },
+        "required": ["note_id"],
+    },
+}
+
+_RINGCENTRAL_UPDATE_NOTE_SCHEMA = {
+    "name": _RINGCENTRAL_UPDATE_NOTE_TOOL_NAME,
+    "description": "Update a RingCentral note title and/or body by note ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "note_id": {"type": "string", "description": "RingCentral note ID."},
+            **_NOTE_WRITE_PROPERTIES,
+        },
+        "required": ["note_id"],
+    },
+}
+
+_RINGCENTRAL_DELETE_NOTE_SCHEMA = {
+    "name": _RINGCENTRAL_DELETE_NOTE_TOOL_NAME,
+    "description": "Delete a RingCentral note by note ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "note_id": {"type": "string", "description": "RingCentral note ID."},
+        },
+        "required": ["note_id"],
+    },
+}
+
+_RINGCENTRAL_PUBLISH_NOTE_SCHEMA = {
+    "name": _RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME,
+    "description": "Publish a draft RingCentral note by note ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "note_id": {"type": "string", "description": "RingCentral note ID."},
+        },
+        "required": ["note_id"],
     },
 }
 
@@ -2826,6 +2918,75 @@ def _artifact_server_url() -> str:
     return os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL
 
 
+def _note_record_count_from_arg(raw: Any) -> int:
+    try:
+        value = int(float(str(raw)))
+    except (TypeError, ValueError):
+        value = 50
+    return min(max(value, 1), 100)
+
+
+def _note_write_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    if "title" in args:
+        payload["title"] = str(args.get("title") or "")
+    if "body" in args:
+        payload["body"] = str(args.get("body") or "")
+    return payload
+
+
+def _note_summary(note: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "id": str(note.get("id") or ""),
+        "title": str(note.get("title") or ""),
+        "status": str(note.get("status") or ""),
+    }
+
+
+def _note_id_from_args(args: Dict[str, Any]) -> str:
+    return str(args.get("note_id") or args.get("id") or "").strip()
+
+
+async def _owner_note_client() -> tuple[Optional[RingCentralClient], str, Optional[str]]:
+    platform = _session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    session_chat_id = _session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    session_user_id = _session_env("HERMES_SESSION_USER_ID", "").strip()
+    if platform != "ringcentral":
+        return None, "", "RingCentral note tools can only be used from a RingCentral session."
+    if not session_chat_id:
+        return None, "", "RingCentral session chat_id is missing."
+    if not session_user_id:
+        return None, "", "RingCentral session user_id is missing."
+
+    owner_creds = _owner_credentials_from({})
+    if not owner_creds:
+        return None, "", "RC_USER_CLIENT_ID, RC_USER_CLIENT_SECRET, and RC_USER_JWT_TOKEN must be set."
+
+    client = RingCentralClient.from_jwt(
+        client_id=owner_creds["client_id"],
+        client_secret=owner_creds["client_secret"],
+        jwt_token=owner_creds["jwt_token"],
+        server_url=os.getenv("RC_SERVER_URL", "").strip() or DEFAULT_SERVER_URL,
+    )
+    ext = await client.get_own_extension()
+    if not isinstance(ext, dict) or not ext.get("id"):
+        await client.close()
+        return None, "", "RingCentral owner authentication failed."
+
+    contact = ext.get("contact") or {}
+    owner_email = _normalize_email(contact.get("email") or "")
+    owner_person_id = str(ext.get("id") or client.owner_id or "")
+    session_user_norm = _normalize_email(session_user_id)
+    if not (
+        session_user_norm == owner_email
+        or session_user_id == owner_person_id
+    ):
+        await client.close()
+        return None, "", "Only the configured RingCentral owner can manage notes."
+
+    return client, session_chat_id, None
+
+
 def _event_record_count_from_arg(raw: Any) -> int:
     try:
         value = int(raw)
@@ -3095,6 +3256,129 @@ async def _ringcentral_delete_adaptive_card(args: Dict[str, Any], **_: Any) -> s
     try:
         deleted = await client.delete_adaptive_card(card_id)
         return _ringcentral_tool_json({"success": bool(deleted), "deleted": bool(deleted)})
+    finally:
+        await client.close()
+
+
+async def _ringcentral_list_notes(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    client, chat_id, error = await _owner_note_client()
+    if error:
+        return _ringcentral_tool_error(error)
+    assert client is not None
+    try:
+        notes = await client.list_notes(chat_id, _note_record_count_from_arg(args.get("record_count")))
+        if notes is None:
+            return _ringcentral_tool_error("RingCentral returned no notes for the current chat.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "notes": [_note_summary(note) for note in notes],
+            "fetched_count": len(notes),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_create_note(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    title = str(args.get("title") or "").strip()
+    if not title:
+        return _ringcentral_tool_error("title is required.")
+    client, chat_id, error = await _owner_note_client()
+    if error:
+        return _ringcentral_tool_error(error)
+    assert client is not None
+    try:
+        note = await client.create_note(chat_id, _note_write_payload(args))
+        if not isinstance(note, dict) or not note.get("id"):
+            return _ringcentral_tool_error("RingCentral note create failed.")
+        published = False
+        if bool(args.get("publish")):
+            published = await client.publish_note(str(note.get("id")))
+        return _ringcentral_tool_json({
+            "success": True,
+            "note_id": str(note.get("id")),
+            "published": published,
+            "note": _note_summary(note),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_get_note(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    note_id = _note_id_from_args(args)
+    if not note_id:
+        return _ringcentral_tool_error("note_id is required.")
+    client, _, error = await _owner_note_client()
+    if error:
+        return _ringcentral_tool_error(error)
+    assert client is not None
+    try:
+        note = await client.get_note(note_id)
+        if not isinstance(note, dict) or not note.get("id"):
+            return _ringcentral_tool_error("RingCentral note read failed.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "note": note,
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_update_note(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    note_id = _note_id_from_args(args)
+    if not note_id:
+        return _ringcentral_tool_error("note_id is required.")
+    updates = _note_write_payload(args)
+    if not updates:
+        return _ringcentral_tool_error("title or body is required.")
+    client, _, error = await _owner_note_client()
+    if error:
+        return _ringcentral_tool_error(error)
+    assert client is not None
+    try:
+        note = await client.update_note(note_id, updates)
+        if not isinstance(note, dict) or not note.get("id"):
+            return _ringcentral_tool_error("RingCentral note update failed.")
+        return _ringcentral_tool_json({
+            "success": True,
+            "note_id": str(note.get("id")),
+            "note": _note_summary(note),
+        })
+    finally:
+        await client.close()
+
+
+async def _ringcentral_delete_note(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    note_id = _note_id_from_args(args)
+    if not note_id:
+        return _ringcentral_tool_error("note_id is required.")
+    client, _, error = await _owner_note_client()
+    if error:
+        return _ringcentral_tool_error(error)
+    assert client is not None
+    try:
+        deleted = await client.delete_note(note_id)
+        return _ringcentral_tool_json({"success": bool(deleted), "deleted": bool(deleted)})
+    finally:
+        await client.close()
+
+
+async def _ringcentral_publish_note(args: Dict[str, Any], **_: Any) -> str:
+    args = args or {}
+    note_id = _note_id_from_args(args)
+    if not note_id:
+        return _ringcentral_tool_error("note_id is required.")
+    client, _, error = await _owner_note_client()
+    if error:
+        return _ringcentral_tool_error(error)
+    assert client is not None
+    try:
+        published = await client.publish_note(note_id)
+        return _ringcentral_tool_json({"success": bool(published), "published": bool(published)})
     finally:
         await client.close()
 
@@ -3601,4 +3885,58 @@ def register(ctx) -> None:
         check_fn=_ringcentral_bot_tool_available,
         is_async=True,
         emoji="🧩",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_LIST_NOTES_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_LIST_NOTES_SCHEMA,
+        handler=_ringcentral_list_notes,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📝",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_CREATE_NOTE_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_CREATE_NOTE_SCHEMA,
+        handler=_ringcentral_create_note,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📝",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_GET_NOTE_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_GET_NOTE_SCHEMA,
+        handler=_ringcentral_get_note,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📝",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_UPDATE_NOTE_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_UPDATE_NOTE_SCHEMA,
+        handler=_ringcentral_update_note,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📝",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_DELETE_NOTE_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_DELETE_NOTE_SCHEMA,
+        handler=_ringcentral_delete_note,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📝",
+    )
+    ctx.register_tool(
+        name=_RINGCENTRAL_PUBLISH_NOTE_TOOL_NAME,
+        toolset="ringcentral",
+        schema=_RINGCENTRAL_PUBLISH_NOTE_SCHEMA,
+        handler=_ringcentral_publish_note,
+        check_fn=_ringcentral_owner_tool_available,
+        is_async=True,
+        emoji="📝",
     )
