@@ -164,7 +164,13 @@ class RingCentralClient:
 
             session = await self._ensure_session()
             url = f"{self._base_url}/restapi/oauth/token"
-            headers = {"Accept": "application/json"}
+            headers = {
+                "Accept": "application/json",
+                "Authorization": aiohttp.encode_basic_auth(
+                    self._client_id,
+                    self._client_secret,
+                ),
+            }
             data = {
                 "grant_type": JWT_GRANT_TYPE,
                 "assertion": self._jwt_token,
@@ -174,7 +180,6 @@ class RingCentralClient:
                     url,
                     headers=headers,
                     data=data,
-                    auth=aiohttp.BasicAuth(self._client_id, self._client_secret),
                 ) as resp:
                     self._last_status = resp.status
                     if resp.status >= 400:
