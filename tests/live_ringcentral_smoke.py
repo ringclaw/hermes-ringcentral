@@ -51,6 +51,7 @@ async def test_ringcentral_live_smoke() -> None:
     owner_client: Any = None
     created_bot_post_ids: List[str] = []
     created_owner_post_ids: List[str] = []
+    created_owner_note_ids: List[str] = []
     ringcentral_logger = logging.getLogger("ringcentral")
     previous_log_level = ringcentral_logger.level
     ringcentral_logger.setLevel(logging.CRITICAL)
@@ -117,6 +118,11 @@ async def test_ringcentral_live_smoke() -> None:
             created_bot_post_ids=created_bot_post_ids,
             created_owner_post_ids=created_owner_post_ids,
         )
+        await run_note_scenario(
+            env=env,
+            owner_client=owner_client,
+            created_owner_note_ids=created_owner_note_ids,
+        )
     except Exception as exc:  # noqa: BLE001
         summary.fail(exc)
         raise
@@ -130,6 +136,11 @@ async def test_ringcentral_live_smoke() -> None:
                     owner_client=owner_client,
                     bot_post_ids=created_bot_post_ids,
                     owner_post_ids=created_owner_post_ids,
+                )
+                await cleanup_notes(
+                    cleanup=env.cleanup,
+                    owner_client=owner_client,
+                    note_ids=created_owner_note_ids,
                 )
             if bot_client:
                 await bot_client.close()
@@ -488,6 +499,45 @@ async def run_threaded_reply_scenario(
     log_safe("owner_read_thread_reply", owner_read_found=True, thread_metadata=True)
 
 
+async def run_note_scenario(
+    *,
+    env: LiveEnv,
+    owner_client: RingCentralClient,
+    created_owner_note_ids: List[str],
+) -> None:
+    title = build_unique_text("note-title")
+    updated_title = build_unique_text("note-title-updated")
+    body = f"<strong>{escape_html(title)}</strong>"
+    updated_body = f"<strong>{escape_html(updated_title)}</strong>"
+
+    created = await live_step(
+        "note_create",
+        lambda: owner_client.create_note(env.chat_id, {"title": title, "body": body}),
+    )
+    assert_live(isinstance(created, dict) and created.get("id"), "note_create", owner_client)
+    note_id = str(created["id"])
+    created_owner_note_ids.append(note_id)
+    log_safe("note_create", created=True)
+
+    read = await live_step("note_get", lambda: owner_client.get_note(note_id))
+    assert_live(isinstance(read, dict) and str(read.get("id")) == note_id, "note_get", owner_client)
+    log_safe("note_get", found=True)
+
+    updated = await live_step(
+        "note_update",
+        lambda: owner_client.update_note(note_id, {"title": updated_title, "body": updated_body}),
+    )
+    assert_live(
+        isinstance(updated, dict) and str(updated.get("id")) == note_id,
+        "note_update",
+        owner_client,
+    )
+    log_safe("note_update", updated=True)
+
+    await live_step("note_publish", lambda: owner_client.publish_note(note_id))
+    log_safe("note_publish", published=True)
+
+
 async def get_chat_metadata(
     owner_client: RingCentralClient,
     bot_client: RingCentralClient,
@@ -656,6 +706,25 @@ async def cleanup_posts(
     )
 
 
+async def cleanup_notes(
+    *,
+    cleanup: bool,
+    owner_client: RingCentralClient,
+    note_ids: List[str],
+) -> None:
+    if not cleanup:
+        log_safe("note_cleanup", enabled=False)
+        return
+
+    cleanup_notes = True
+    for note_id in reversed(note_ids):
+        try:
+            cleanup_notes = bool(await owner_client.delete_note(note_id)) and cleanup_notes
+        except Exception:  # noqa: BLE001
+            cleanup_notes = False
+    log_safe("note_cleanup", cleanup_notes=cleanup_notes)
+
+
 def build_unique_text(label: str) -> str:
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
@@ -670,6 +739,14 @@ def build_unique_text(label: str) -> str:
             f"commit: {commit_sha}" if commit_sha else "",
         )
         if part
+    )
+
+
+def escape_html(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
 
 

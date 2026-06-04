@@ -40,6 +40,13 @@ from ringcentral.adapter import (  # noqa: E402
     _require_mention,
     _ringcentral_get_recent_messages,
     _ringcentral_history_tool_available,
+    _ringcentral_owner_tool_available,
+    _ringcentral_list_notes,
+    _ringcentral_create_note,
+    _ringcentral_get_note,
+    _ringcentral_update_note,
+    _ringcentral_delete_note,
+    _ringcentral_publish_note,
     _RINGCENTRAL_HISTORY_TOOL_NAME,
     _standalone_send,
     _thread_require_mention,
@@ -247,6 +254,60 @@ class TestRingCentralClientOAuth:
                 "/team-messaging/v1/chats/g-1/posts",
                 {"json_body": {"text": "reply", "threadId": 333333333333}},
             )
+        ]
+
+    def test_note_methods_use_verified_endpoints(self):
+        calls = []
+        client = RingCentralClient("access-token", server_url="https://platform.example.test")
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if method == "GET" and path.endswith("/notes?recordCount=10"):
+                return {"records": [{"id": "note-1", "title": "Note"}]}
+            if method in {"DELETE", "POST"} and path.endswith("/publish"):
+                return b""
+            if method == "DELETE":
+                return b""
+            return {"id": "note-1", "title": "Note"}
+
+        client._request = fake_request
+
+        notes = asyncio.run(client.list_notes("g-1", 10))
+        created = asyncio.run(client.create_note("g-1", {"title": "Note", "body": "<b>Body</b>"}))
+        read = asyncio.run(client.get_note("note-1"))
+        updated = asyncio.run(client.update_note("note-1", {"title": "Updated"}))
+        published = asyncio.run(client.publish_note("note-1"))
+        deleted = asyncio.run(client.delete_note("note-1"))
+
+        assert notes == [{"id": "note-1", "title": "Note"}]
+        assert created == {"id": "note-1", "title": "Note"}
+        assert read == {"id": "note-1", "title": "Note"}
+        assert updated == {"id": "note-1", "title": "Note"}
+        assert published is True
+        assert deleted is True
+        assert calls == [
+            ("GET", "/team-messaging/v1/chats/g-1/notes?recordCount=10", {}),
+            (
+                "POST",
+                "/team-messaging/v1/chats/g-1/notes",
+                {"json_body": {"title": "Note", "body": "<b>Body</b>"}},
+            ),
+            ("GET", "/team-messaging/v1/notes/note-1", {}),
+            (
+                "PATCH",
+                "/team-messaging/v1/notes/note-1",
+                {"json_body": {"title": "Updated"}},
+            ),
+            (
+                "POST",
+                "/team-messaging/v1/notes/note-1/publish",
+                {"expect_json": False},
+            ),
+            (
+                "DELETE",
+                "/team-messaging/v1/notes/note-1",
+                {"expect_json": False},
+            ),
         ]
 
     def test_search_directory_posts_search_string(self):
@@ -2042,6 +2103,29 @@ class TestRingCentralHistoryTool:
             for token in reversed(tokens):
                 token.var.reset(token)
 
+    @staticmethod
+    def _call_note_tool(
+        handler,
+        args: dict,
+        *,
+        platform: str = "ringcentral",
+        chat_id: str = "g-1",
+        user_id: str = "owner@example.com",
+    ) -> dict:
+        from gateway.session_context import set_session_vars
+
+        tokens = set_session_vars(
+            platform=platform,
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name="Owner",
+        )
+        try:
+            return json.loads(asyncio.run(handler(args)))
+        finally:
+            for token in reversed(tokens):
+                token.var.reset(token)
+
     def _call_tool_with_clients(self, monkeypatch, bot, owner, args, **session):
         self._set_owner_env(monkeypatch)
         with patch.object(_rc_mod, "RingCentralClient", return_value=bot) as client_cls:
@@ -2058,6 +2142,81 @@ class TestRingCentralHistoryTool:
 
         self._set_owner_env(monkeypatch)
         assert _ringcentral_history_tool_available() is True
+
+    def test_note_tool_availability_requires_owner_env(self, monkeypatch):
+        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
+        assert _ringcentral_owner_tool_available() is False
+
+        self._set_owner_env(monkeypatch)
+        assert _ringcentral_owner_tool_available() is True
+
+    def test_note_tools_use_owner_current_session(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        owner = MagicMock()
+        owner.owner_id = "owner-1"
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+        owner.list_notes = AsyncMock(return_value=[{"id": "n1", "title": "Note", "status": "Draft"}])
+        owner.create_note = AsyncMock(return_value={"id": "n1", "title": "Note", "status": "Draft"})
+        owner.get_note = AsyncMock(return_value={"id": "n1", "title": "Note", "body": "<b>Body</b>"})
+        owner.update_note = AsyncMock(return_value={"id": "n1", "title": "Updated", "status": "Draft"})
+        owner.delete_note = AsyncMock(return_value=True)
+        owner.publish_note = AsyncMock(return_value=True)
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            listed = self._call_note_tool(_ringcentral_list_notes, {"record_count": 10})
+            created = self._call_note_tool(
+                _ringcentral_create_note,
+                {"title": "Note", "body": "<b>Body</b>", "publish": True},
+            )
+            read = self._call_note_tool(_ringcentral_get_note, {"note_id": "n1"})
+            updated = self._call_note_tool(_ringcentral_update_note, {"note_id": "n1", "title": "Updated"})
+            published = self._call_note_tool(_ringcentral_publish_note, {"note_id": "n1"})
+            deleted = self._call_note_tool(_ringcentral_delete_note, {"note_id": "n1"})
+
+        assert listed["success"] is True
+        assert listed["notes"] == [{"id": "n1", "title": "Note", "status": "Draft"}]
+        assert created == {
+            "success": True,
+            "note_id": "n1",
+            "published": True,
+            "note": {"id": "n1", "title": "Note", "status": "Draft"},
+        }
+        assert read["note"]["body"] == "<b>Body</b>"
+        assert updated["note"] == {"id": "n1", "title": "Updated", "status": "Draft"}
+        assert published == {"success": True, "published": True}
+        assert deleted == {"success": True, "deleted": True}
+        owner.list_notes.assert_awaited_once_with("g-1", 10)
+        owner.create_note.assert_awaited_once_with("g-1", {"title": "Note", "body": "<b>Body</b>"})
+        owner.publish_note.assert_any_await("n1")
+        owner.update_note.assert_awaited_once_with("n1", {"title": "Updated"})
+        assert owner.close.await_count == 6
+
+    def test_note_tool_rejects_non_owner_session_user(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        owner = MagicMock()
+        owner.owner_id = "owner-1"
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            result = self._call_note_tool(
+                _ringcentral_create_note,
+                {"title": "Note"},
+                user_id="alice@example.com",
+            )
+
+        assert result["success"] is False
+        assert "owner" in result["error"]
+        owner.create_note.assert_not_called()
 
     def test_owner_dm_tool_fetches_group_history(self, monkeypatch):
         bot, owner = self._clients()
