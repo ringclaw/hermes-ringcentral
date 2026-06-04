@@ -51,6 +51,7 @@ async def test_ringcentral_live_smoke() -> None:
     owner_client: Any = None
     created_bot_post_ids: List[str] = []
     created_owner_post_ids: List[str] = []
+    created_owner_event_ids: List[str] = []
     ringcentral_logger = logging.getLogger("ringcentral")
     previous_log_level = ringcentral_logger.level
     ringcentral_logger.setLevel(logging.CRITICAL)
@@ -117,6 +118,11 @@ async def test_ringcentral_live_smoke() -> None:
             created_bot_post_ids=created_bot_post_ids,
             created_owner_post_ids=created_owner_post_ids,
         )
+        await run_calendar_event_scenario(
+            env=env,
+            owner_client=owner_client,
+            created_owner_event_ids=created_owner_event_ids,
+        )
     except Exception as exc:  # noqa: BLE001
         summary.fail(exc)
         raise
@@ -130,6 +136,11 @@ async def test_ringcentral_live_smoke() -> None:
                     owner_client=owner_client,
                     bot_post_ids=created_bot_post_ids,
                     owner_post_ids=created_owner_post_ids,
+                )
+                await cleanup_events(
+                    cleanup=env.cleanup,
+                    owner_client=owner_client,
+                    event_ids=created_owner_event_ids,
                 )
             if bot_client:
                 await bot_client.close()
@@ -488,6 +499,51 @@ async def run_threaded_reply_scenario(
     log_safe("owner_read_thread_reply", owner_read_found=True, thread_metadata=True)
 
 
+async def run_calendar_event_scenario(
+    *,
+    env: LiveEnv,
+    owner_client: RingCentralClient,
+    created_owner_event_ids: List[str],
+) -> None:
+    event_payload = build_calendar_event_payload("calendar-event")
+    updated_payload = build_calendar_event_payload("calendar-event-updated")
+
+    created = await live_step(
+        "calendar_event_create",
+        lambda: owner_client.create_event(env.chat_id, event_payload),
+    )
+    assert_live(isinstance(created, dict) and created.get("id"), "calendar_event_create", owner_client)
+    event_id = str(created["id"])
+    created_owner_event_ids.append(event_id)
+    log_safe("calendar_event_create", created=True)
+
+    listed = await live_step(
+        "calendar_event_list",
+        lambda: owner_client.list_events(env.chat_id, min(env.record_count, 50)),
+    )
+    assert_live(
+        isinstance(listed, list) and any(str(event.get("id")) == event_id for event in listed),
+        "calendar_event_list",
+        owner_client,
+    )
+    log_safe("calendar_event_list", found=True)
+
+    read = await live_step("calendar_event_get", lambda: owner_client.get_event(event_id))
+    assert_live(isinstance(read, dict) and str(read.get("id")) == event_id, "calendar_event_get", owner_client)
+    log_safe("calendar_event_get", found=True)
+
+    updated = await live_step(
+        "calendar_event_update",
+        lambda: owner_client.update_event(event_id, updated_payload),
+    )
+    assert_live(
+        isinstance(updated, dict) and str(updated.get("id")) == event_id,
+        "calendar_event_update",
+        owner_client,
+    )
+    log_safe("calendar_event_update", updated=True)
+
+
 async def get_chat_metadata(
     owner_client: RingCentralClient,
     bot_client: RingCentralClient,
@@ -656,6 +712,25 @@ async def cleanup_posts(
     )
 
 
+async def cleanup_events(
+    *,
+    cleanup: bool,
+    owner_client: RingCentralClient,
+    event_ids: List[str],
+) -> None:
+    if not cleanup:
+        log_safe("calendar_event_cleanup", enabled=False)
+        return
+
+    cleanup_events_ok = True
+    for event_id in reversed(event_ids):
+        try:
+            cleanup_events_ok = bool(await owner_client.delete_event(event_id)) and cleanup_events_ok
+        except Exception:  # noqa: BLE001
+            cleanup_events_ok = False
+    log_safe("calendar_event_cleanup", cleanup_events=cleanup_events_ok)
+
+
 def build_unique_text(label: str) -> str:
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
@@ -671,6 +746,22 @@ def build_unique_text(label: str) -> str:
         )
         if part
     )
+
+
+def build_calendar_event_payload(label: str) -> Dict[str, Any]:
+    marker = build_unique_text(label).split("\n")[0]
+    start_time = time.time() + 60 * 60
+    end_time = time.time() + 2 * 60 * 60
+    return {
+        "title": marker,
+        "startTime": iso_timestamp(start_time),
+        "endTime": iso_timestamp(end_time),
+        "description": build_unique_text(f"{label}-description"),
+    }
+
+
+def iso_timestamp(epoch_seconds: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_seconds))
 
 
 def has_thread_metadata(post: Dict[str, Any], parent_post_id: str) -> bool:

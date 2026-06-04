@@ -38,8 +38,14 @@ from ringcentral.adapter import (  # noqa: E402
     _no_thread_channels,
     _normalize_allowed_user_emails_env,
     _require_mention,
+    _ringcentral_create_calendar_event,
+    _ringcentral_delete_calendar_event,
+    _ringcentral_get_calendar_event,
     _ringcentral_get_recent_messages,
     _ringcentral_history_tool_available,
+    _ringcentral_list_calendar_events,
+    _ringcentral_owner_tool_available,
+    _ringcentral_update_calendar_event,
     _RINGCENTRAL_HISTORY_TOOL_NAME,
     _standalone_send,
     _thread_require_mention,
@@ -267,6 +273,67 @@ class TestRingCentralClientOAuth:
             "/restapi/v1.0/account/~/directory/entries/search",
             {"json_body": {"searchString": "Alice"}},
         )]
+
+    def test_calendar_event_methods_use_verified_endpoints(self):
+        calls = []
+        client = RingCentralClient("access-token", server_url="https://platform.example.test")
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if method == "GET" and path.endswith("/events?recordCount=10"):
+                return {"records": [{"id": "event-1", "title": "Planning"}]}
+            if method == "DELETE":
+                return b""
+            return {"id": "event-1", "title": "Planning"}
+
+        client._request = fake_request
+
+        events = asyncio.run(client.list_events("g-1", 10))
+        created = asyncio.run(client.create_event("g-1", {
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        }))
+        read = asyncio.run(client.get_event("event-1"))
+        updated = asyncio.run(client.update_event("event-1", {
+            "title": "Updated",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        }))
+        deleted = asyncio.run(client.delete_event("event-1"))
+
+        assert events == [{"id": "event-1", "title": "Planning"}]
+        assert created == {"id": "event-1", "title": "Planning"}
+        assert read == {"id": "event-1", "title": "Planning"}
+        assert updated == {"id": "event-1", "title": "Planning"}
+        assert deleted is True
+        assert calls == [
+            ("GET", "/team-messaging/v1/groups/g-1/events?recordCount=10", {}),
+            (
+                "POST",
+                "/team-messaging/v1/groups/g-1/events",
+                {
+                    "json_body": {
+                        "title": "Planning",
+                        "startTime": "2026-06-04T10:00:00Z",
+                        "endTime": "2026-06-04T11:00:00Z",
+                    },
+                },
+            ),
+            ("GET", "/team-messaging/v1/events/event-1", {}),
+            (
+                "PUT",
+                "/team-messaging/v1/events/event-1",
+                {
+                    "json_body": {
+                        "title": "Updated",
+                        "startTime": "2026-06-04T10:00:00Z",
+                        "endTime": "2026-06-04T11:00:00Z",
+                    },
+                },
+            ),
+            ("DELETE", "/team-messaging/v1/events/event-1", {"expect_json": False}),
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +873,8 @@ class TestPluginRegistration:
                 self.platform_kwargs = kwargs
 
             def register_tool(self, **kwargs):
-                self.tool_kwargs = kwargs
+                self.tool_kwargs_list = getattr(self, "tool_kwargs_list", [])
+                self.tool_kwargs_list.append(kwargs)
 
         ctx = Ctx()
         register(ctx)
@@ -817,11 +885,14 @@ class TestPluginRegistration:
         assert isinstance(adapter, RingCentralAdapter)
         assert ctx.platform_kwargs["allowed_users_env"] == "RC_ALLOWED_USER_EMAILS"
         assert ctx.platform_kwargs["allow_all_env"] == "RC_ALLOW_ALL_USERS"
-        assert ctx.tool_kwargs["name"] == _RINGCENTRAL_HISTORY_TOOL_NAME
-        assert ctx.tool_kwargs["toolset"] == "ringcentral"
-        assert ctx.tool_kwargs["handler"] is _ringcentral_get_recent_messages
-        assert ctx.tool_kwargs["check_fn"] is _ringcentral_history_tool_available
-        assert ctx.tool_kwargs["is_async"] is True
+        history_tool = next(
+            tool for tool in ctx.tool_kwargs_list
+            if tool["name"] == _RINGCENTRAL_HISTORY_TOOL_NAME
+        )
+        assert history_tool["toolset"] == "ringcentral"
+        assert history_tool["handler"] is _ringcentral_get_recent_messages
+        assert history_tool["check_fn"] is _ringcentral_history_tool_available
+        assert history_tool["is_async"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2048,6 +2119,29 @@ class TestRingCentralHistoryTool:
             client_cls.from_jwt.return_value = owner
             return self._call_tool(args, **session)
 
+    @staticmethod
+    def _call_calendar_tool(
+        handler,
+        args: dict,
+        *,
+        platform: str = "ringcentral",
+        chat_id: str = "g-1",
+        user_id: str = "owner@example.com",
+    ) -> dict:
+        from gateway.session_context import set_session_vars
+
+        tokens = set_session_vars(
+            platform=platform,
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name="Owner",
+        )
+        try:
+            return json.loads(asyncio.run(handler(args)))
+        finally:
+            for token in reversed(tokens):
+                token.var.reset(token)
+
     def test_history_tool_availability_requires_bot_and_owner_env(self, monkeypatch):
         monkeypatch.delenv("RC_BOT_TOKEN", raising=False)
         monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
@@ -2058,6 +2152,119 @@ class TestRingCentralHistoryTool:
 
         self._set_owner_env(monkeypatch)
         assert _ringcentral_history_tool_available() is True
+
+    def test_calendar_event_tool_availability_requires_owner_env(self, monkeypatch):
+        monkeypatch.delenv("RC_USER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("RC_USER_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("RC_USER_JWT_TOKEN", raising=False)
+
+        assert _ringcentral_owner_tool_available() is False
+
+        self._set_owner_env(monkeypatch)
+        assert _ringcentral_owner_tool_available() is True
+
+    def test_calendar_event_tools_use_owner_current_session(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        owner = MagicMock()
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+        owner.list_events = AsyncMock(return_value=[{
+            "id": "event-1",
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        }])
+        owner.create_event = AsyncMock(return_value={
+            "id": "event-1",
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+        })
+        owner.get_event = AsyncMock(return_value={"id": "event-1", "title": "Planning"})
+        owner.update_event = AsyncMock(return_value={
+            "id": "event-1",
+            "title": "Updated",
+            "startTime": "2026-06-04T12:00:00Z",
+            "endTime": "2026-06-04T13:00:00Z",
+        })
+        owner.delete_event = AsyncMock(return_value=True)
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            listed = self._call_calendar_tool(_ringcentral_list_calendar_events, {"record_count": 10})
+            created = self._call_calendar_tool(
+                _ringcentral_create_calendar_event,
+                {
+                    "title": "Planning",
+                    "start_time": "2026-06-04T10:00:00Z",
+                    "end_time": "2026-06-04T11:00:00Z",
+                    "description": "Agenda",
+                },
+            )
+            read = self._call_calendar_tool(_ringcentral_get_calendar_event, {"event_id": "event-1"})
+            updated = self._call_calendar_tool(
+                _ringcentral_update_calendar_event,
+                {
+                    "event_id": "event-1",
+                    "title": "Updated",
+                    "start_time": "2026-06-04T12:00:00Z",
+                    "end_time": "2026-06-04T13:00:00Z",
+                },
+            )
+            deleted = self._call_calendar_tool(_ringcentral_delete_calendar_event, {"event_id": "event-1"})
+
+        assert listed["events"] == [{
+            "id": "event-1",
+            "title": "Planning",
+            "start_time": "2026-06-04T10:00:00Z",
+            "end_time": "2026-06-04T11:00:00Z",
+        }]
+        assert created["event_id"] == "event-1"
+        assert read["event"]["id"] == "event-1"
+        assert updated["event"]["title"] == "Updated"
+        assert deleted == {"success": True, "event_id": "event-1"}
+        owner.list_events.assert_awaited_once_with("g-1", 10)
+        owner.create_event.assert_awaited_once_with("g-1", {
+            "title": "Planning",
+            "startTime": "2026-06-04T10:00:00Z",
+            "endTime": "2026-06-04T11:00:00Z",
+            "description": "Agenda",
+        })
+        owner.get_event.assert_awaited_once_with("event-1")
+        owner.update_event.assert_awaited_once_with("event-1", {
+            "title": "Updated",
+            "startTime": "2026-06-04T12:00:00Z",
+            "endTime": "2026-06-04T13:00:00Z",
+        })
+        owner.delete_event.assert_awaited_once_with("event-1")
+        assert owner.close.await_count == 5
+
+    def test_calendar_event_tool_rejects_non_owner_session_user(self, monkeypatch):
+        self._set_owner_env(monkeypatch)
+        owner = MagicMock()
+        owner.get_own_extension = AsyncMock(return_value={
+            "id": "owner-1",
+            "contact": {"email": "owner@example.com"},
+        })
+        owner.close = AsyncMock()
+        owner.create_event = AsyncMock()
+
+        with patch.object(_rc_mod.RingCentralClient, "from_jwt", return_value=owner):
+            result = self._call_calendar_tool(
+                _ringcentral_create_calendar_event,
+                {
+                    "title": "Planning",
+                    "start_time": "2026-06-04T10:00:00Z",
+                    "end_time": "2026-06-04T11:00:00Z",
+                },
+                user_id="alice@example.com",
+            )
+
+        assert result["success"] is False
+        assert "Only the configured RingCentral owner" in result["error"]
+        owner.create_event.assert_not_called()
 
     def test_owner_dm_tool_fetches_group_history(self, monkeypatch):
         bot, owner = self._clients()
