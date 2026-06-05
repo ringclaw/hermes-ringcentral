@@ -122,7 +122,9 @@ async def test_ringcentral_live_smoke() -> None:
         )
         await run_calendar_event_scenario(
             env=env,
+            bot_client=bot_client,
             owner_client=owner_client,
+            created_bot_post_ids=created_bot_post_ids,
             created_owner_event_ids=created_owner_event_ids,
         )
         await run_adaptive_card_scenario(
@@ -524,7 +526,9 @@ async def run_threaded_reply_scenario(
 async def run_calendar_event_scenario(
     *,
     env: LiveEnv,
+    bot_client: RingCentralClient,
     owner_client: RingCentralClient,
+    created_bot_post_ids: List[str],
     created_owner_event_ids: List[str],
 ) -> None:
     event_payload = build_calendar_event_payload("calendar-event")
@@ -564,6 +568,25 @@ async def run_calendar_event_scenario(
         owner_client,
     )
     log_safe("calendar_event_update", updated=True)
+
+    audit_text = build_calendar_event_audit_text()
+    audit_post = await live_step("calendar_event_audit_post", lambda: bot_client.send_post(env.chat_id, audit_text))
+    assert_live(isinstance(audit_post, dict) and audit_post.get("id"), "calendar_event_audit_post", bot_client)
+    created_bot_post_ids.append(str(audit_post["id"]))
+    log_safe("calendar_event_audit_post", sent=True)
+
+    found_audit = await live_step(
+        "owner_read_calendar_event_audit",
+        lambda: wait_for_post(owner_client, env.chat_id, audit_text, env.record_count),
+    )
+    assert_live(
+        isinstance(found_audit, dict)
+        and str(found_audit.get("id")) == str(audit_post["id"])
+        and audit_text in str(found_audit.get("text") or ""),
+        "owner_read_calendar_event_audit",
+        owner_client,
+    )
+    log_safe("owner_read_calendar_event_audit", found=True)
 
 
 async def run_adaptive_card_scenario(
@@ -878,6 +901,19 @@ def build_unique_text(label: str) -> str:
             marker,
             f"source: {source_url}" if source_url else "",
             f"commit: {commit_sha}" if commit_sha else "",
+        )
+        if part
+    )
+
+
+def build_calendar_event_audit_text() -> str:
+    marker, *context = build_unique_text("calendar-event-audit").split("\n")
+    return "\n".join(
+        part
+        for part in (
+            marker,
+            "calendar_event_smoke: create/list/get/update ok",
+            *context,
         )
         if part
     )
