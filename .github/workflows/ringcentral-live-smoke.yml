@@ -63,4 +63,4 @@ jobs:
           pip install -e .
 
       - name: Run RingCentral live smoke
-        run: pytest -q tests/live_ringcentral_smoke.py
+        run: pytest -q tests/live_ringcentral_smoke.py -s
