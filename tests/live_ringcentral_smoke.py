@@ -311,7 +311,7 @@ def read_live_env() -> LiveEnv:
         record_count=read_positive_int_env("RC_E2E_RECORD_COUNT", 50, 1, 1000),
         cleanup=read_bool_env("RC_E2E_CLEANUP", False),
         ws_timeout_ms=read_positive_int_env("RC_E2E_WS_TIMEOUT_MS", 30_000, 5_000, 120_000),
-        file_upload=read_bool_env("RC_E2E_FILE_UPLOAD", False),
+        file_upload=read_bool_env("RC_E2E_FILE_UPLOAD", True),
     )
     if missing:
         raise RuntimeError(f"Missing RingCentral live smoke variables: {', '.join(missing)}")
@@ -337,7 +337,7 @@ def build_base_summary_context() -> Dict[str, Any]:
         "cleanup": read_bool_env("RC_E2E_CLEANUP", False),
         "record_count": read_positive_int_env("RC_E2E_RECORD_COUNT", 50, 1, 1000),
         "ws_timeout_ms": read_positive_int_env("RC_E2E_WS_TIMEOUT_MS", 30_000, 5_000, 120_000),
-        "file_upload": read_bool_env("RC_E2E_FILE_UPLOAD", False),
+        "file_upload": read_bool_env("RC_E2E_FILE_UPLOAD", True),
     }
 
 
