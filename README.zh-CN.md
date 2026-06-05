@@ -84,6 +84,11 @@ export RC_PROCESSING_EMOJI_ENABLED=true
 export RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS=5
 export RC_HOME_CHANNEL="g-abc123"
 export RC_HOME_CHANNEL_NAME="Hermes Updates"
+
+# 入站附件只会在消息通过访问策略后下载。
+export RC_ATTACHMENT_DOWNLOAD_ENABLED=true
+export RC_ATTACHMENT_MAX_COUNT=5
+export RC_ATTACHMENT_MAX_BYTES=5242880
 ```
 
 长期使用建议把这些变量写到 `~/.hermes/.env`，这样不需要每次手动 export。

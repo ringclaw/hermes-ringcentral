@@ -85,6 +85,11 @@ export RC_PROCESSING_EMOJI_ENABLED=true
 export RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS=5
 export RC_HOME_CHANNEL="g-abc123"
 export RC_HOME_CHANNEL_NAME="Hermes Updates"
+
+# Inbound attachments are downloaded only after message admission succeeds.
+export RC_ATTACHMENT_DOWNLOAD_ENABLED=true
+export RC_ATTACHMENT_MAX_COUNT=5
+export RC_ATTACHMENT_MAX_BYTES=5242880
 ```
 
 Put persistent values in `~/.hermes/.env` if you do not want to export them in
