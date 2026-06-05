@@ -43,6 +43,7 @@ failure; errors are logged at warning/error level. Callers should treat
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -68,6 +69,11 @@ MAX_RETRY_AFTER_SECONDS = 30.0
 TOKEN_REFRESH_SKEW_SECONDS = 60.0
 
 JWT_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
+
+def _basic_auth_header(client_id: str, client_secret: str) -> str:
+    token = f"{client_id}:{client_secret}".encode("utf-8")
+    return f"Basic {base64.b64encode(token).decode('ascii')}"
 
 
 def _json_id_value(value: Any) -> Any:
@@ -177,19 +183,16 @@ class RingCentralClient:
 
             import aiohttp
 
-            session = await self._ensure_session()
             url = f"{self._base_url}/restapi/oauth/token"
             headers = {
                 "Accept": "application/json",
-                "Authorization": aiohttp.encode_basic_auth(
-                    self._client_id,
-                    self._client_secret,
-                ),
+                "Authorization": _basic_auth_header(self._client_id, self._client_secret),
             }
             data = {
                 "grant_type": JWT_GRANT_TYPE,
                 "assertion": self._jwt_token,
             }
+            session = await self._ensure_session()
             try:
                 async with session.post(
                     url,
@@ -217,6 +220,9 @@ class RingCentralClient:
                 logger.error("RC OAuth JWT exchange timed out")
                 self._token = ""
                 return
+            except Exception:
+                await self.close()
+                raise
 
             access_token = str(payload.get("access_token") or "").strip()
             if not access_token:
