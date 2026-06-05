@@ -554,12 +554,17 @@ async def run_calendar_event_scenario(
     assert_live(isinstance(read, dict) and str(read.get("id")) == event_id, "calendar_event_get", owner_client)
     log_safe("calendar_event_get", found=True)
 
-    updated = await live_step(
-        "calendar_event_update",
-        lambda: owner_client.update_event(event_id, updated_payload),
-    )
+    async def update_and_read_event() -> Optional[Dict[str, Any]]:
+        response = await owner_client.update_event(event_id, updated_payload)
+        if isinstance(response, dict) and response.get("title") == updated_payload["title"]:
+            return response
+        return await owner_client.get_event(event_id)
+
+    updated = await live_step("calendar_event_update", update_and_read_event)
     assert_live(
-        isinstance(updated, dict) and str(updated.get("id")) == event_id,
+        isinstance(updated, dict)
+        and str(updated.get("id")) == event_id
+        and updated.get("title") == updated_payload["title"],
         "calendar_event_update",
         owner_client,
     )
