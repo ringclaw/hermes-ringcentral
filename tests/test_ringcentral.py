@@ -193,8 +193,84 @@ class TestRingCentralClientOAuth:
             "assertion": "jwt-token",
         }
         assert session.post_kwargs["headers"]["Accept"] == "application/json"
-        assert session.post_kwargs["headers"]["Authorization"].startswith("Basic ")
+        assert session.post_kwargs["headers"]["Authorization"] == "Basic Y2lkOnNlY3JldA=="
         assert "auth" not in session.post_kwargs
+
+    @pytest.mark.asyncio
+    async def test_jwt_exchange_with_real_aiohttp_uses_basic_header(self):
+        from aiohttp import web
+
+        captured: dict[str, Any] = {}
+
+        async def token_handler(request):
+            form = await request.post()
+            captured["authorization"] = request.headers.get("Authorization")
+            captured["accept"] = request.headers.get("Accept")
+            captured["grant_type"] = form.get("grant_type")
+            captured["assertion"] = form.get("assertion")
+            return web.json_response(
+                {
+                    "access_token": "access-real",
+                    "expires_in": 3600,
+                    "owner_id": "owner-real",
+                }
+            )
+
+        app = web.Application()
+        app.router.add_post("/restapi/oauth/token", token_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        assert site._server is not None
+        port = site._server.sockets[0].getsockname()[1]
+        client = RingCentralClient.from_jwt(
+            client_id="cid",
+            client_secret="secret",
+            jwt_token="jwt-token",
+            server_url=f"http://127.0.0.1:{port}",
+            request_timeout=5,
+        )
+
+        try:
+            await client._ensure_access_token()
+        finally:
+            await client.close()
+            await runner.cleanup()
+
+        assert client._token == "access-real"
+        assert client.owner_id == "owner-real"
+        assert captured == {
+            "authorization": "Basic Y2lkOnNlY3JldA==",
+            "accept": "application/json",
+            "grant_type": JWT_GRANT_TYPE,
+            "assertion": "jwt-token",
+        }
+
+    def test_jwt_exchange_closes_session_on_unexpected_error(self):
+        class _Session:
+            closed = False
+
+            def post(self, url, **kwargs):
+                raise RuntimeError("boom")
+
+            async def close(self):
+                self.closed = True
+
+        session = _Session()
+        client = RingCentralClient.from_jwt(
+            client_id="cid",
+            client_secret="secret",
+            jwt_token="jwt-token",
+            server_url="https://platform.example.test",
+        )
+        client._session = session
+
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(client._ensure_access_token())
+
+        assert session.closed is True
+        assert client._session is None
 
     def test_websocket_token_uses_wstoken_endpoint(self):
         calls = []
