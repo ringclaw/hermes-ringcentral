@@ -98,6 +98,13 @@ async def test_ringcentral_live_smoke() -> None:
             lambda: assert_client_can_read_history(bot_client, env.chat_id, env.record_count),
         )
 
+        await run_file_upload_scenario(
+            env=env,
+            bot_client=bot_client,
+            owner_client=owner_client,
+            bot_person_id=str(bot_extension.get("id") or ""),
+            created_owner_post_ids=created_owner_post_ids,
+        )
         await run_bot_send_owner_read_scenario(
             env=env,
             bot_client=bot_client,
@@ -186,6 +193,7 @@ class LiveEnv:
     record_count: int
     cleanup: bool
     ws_timeout_ms: int
+    file_upload: bool
 
 
 class LiveSummary:
@@ -303,6 +311,7 @@ def read_live_env() -> LiveEnv:
         record_count=read_positive_int_env("RC_E2E_RECORD_COUNT", 50, 1, 1000),
         cleanup=read_bool_env("RC_E2E_CLEANUP", False),
         ws_timeout_ms=read_positive_int_env("RC_E2E_WS_TIMEOUT_MS", 30_000, 5_000, 120_000),
+        file_upload=read_bool_env("RC_E2E_FILE_UPLOAD", True),
     )
     if missing:
         raise RuntimeError(f"Missing RingCentral live smoke variables: {', '.join(missing)}")
@@ -315,6 +324,7 @@ def build_summary_context(env: LiveEnv) -> Dict[str, Any]:
         "cleanup": env.cleanup,
         "record_count": env.record_count,
         "ws_timeout_ms": env.ws_timeout_ms,
+        "file_upload": env.file_upload,
     }
 
 
@@ -327,6 +337,7 @@ def build_base_summary_context() -> Dict[str, Any]:
         "cleanup": read_bool_env("RC_E2E_CLEANUP", False),
         "record_count": read_positive_int_env("RC_E2E_RECORD_COUNT", 50, 1, 1000),
         "ws_timeout_ms": read_positive_int_env("RC_E2E_WS_TIMEOUT_MS", 30_000, 5_000, 120_000),
+        "file_upload": read_bool_env("RC_E2E_FILE_UPLOAD", True),
     }
 
 
@@ -336,6 +347,108 @@ def read_positive_int_env(name: str, default: int, minimum: int, maximum: int) -
     except (TypeError, ValueError):
         value = default
     return min(max(value, minimum), maximum)
+
+
+async def run_file_upload_scenario(
+    *,
+    env: LiveEnv,
+    bot_client: RingCentralClient,
+    owner_client: RingCentralClient,
+    bot_person_id: str,
+    created_owner_post_ids: List[str],
+) -> None:
+    if not env.file_upload:
+        log_safe("file_upload", enabled=False)
+        return
+
+    image_file_name = build_unique_file_name("image", "png")
+    document_file_name = build_unique_file_name("document", "txt")
+    waiter = await start_websocket_attachment_wait(
+        client=bot_client,
+        person_id=bot_person_id,
+        chat_id=env.chat_id,
+        expected_file_name=image_file_name,
+    )
+    try:
+        await live_step(
+            "file_upload_ws_connect",
+            lambda: with_timeout(waiter.connected, env.ws_timeout_ms, "file_upload_ws_connect"),
+        )
+        await live_step(
+            "file_upload_ws_subscribe",
+            lambda: with_timeout(waiter.subscribed, env.ws_timeout_ms, "file_upload_ws_subscribe"),
+        )
+
+        image_upload = await live_step(
+            "file_upload_image",
+            lambda: owner_client.upload_file(
+                env.chat_id,
+                tiny_png_bytes(),
+                image_file_name,
+                "image/png",
+            ),
+        )
+        assert_live(image_upload, "file_upload_image", owner_client)
+        log_safe("file_upload_image", uploaded=True)
+
+        received = await live_step(
+            "file_upload_ws_receive",
+            lambda: with_timeout(waiter.received, env.ws_timeout_ms, "file_upload_ws_receive"),
+        )
+        assert_live(has_attachment(received, image_file_name), "file_upload_ws_receive")
+        log_safe("file_upload_ws_receive", ws_received=True)
+
+        image_post = await live_step(
+            "file_upload_image_bot_read",
+            lambda: wait_for_attachment_post(bot_client, env.chat_id, image_file_name, image_upload, env.record_count),
+        )
+        assert_live(image_post, "file_upload_image_bot_read", bot_client)
+        created_owner_post_ids.append(str(image_post.get("id")))
+        log_safe("file_upload_image_bot_read", found=True)
+
+        await assert_attachment_download_handoff(
+            stage="file_upload_image_handoff",
+            env=env,
+            bot_client=bot_client,
+            uploaded=image_upload,
+            post=image_post,
+        )
+
+        document_upload = await live_step(
+            "file_upload_document",
+            lambda: owner_client.upload_file(
+                env.chat_id,
+                b"RingCentral live smoke document attachment\n",
+                document_file_name,
+                "text/plain",
+            ),
+        )
+        assert_live(document_upload, "file_upload_document", owner_client)
+        log_safe("file_upload_document", uploaded=True)
+
+        document_post = await live_step(
+            "file_upload_document_bot_read",
+            lambda: wait_for_attachment_post(
+                bot_client,
+                env.chat_id,
+                document_file_name,
+                document_upload,
+                env.record_count,
+            ),
+        )
+        assert_live(document_post, "file_upload_document_bot_read", bot_client)
+        created_owner_post_ids.append(str(document_post.get("id")))
+        log_safe("file_upload_document_bot_read", found=True)
+
+        await assert_attachment_download_handoff(
+            stage="file_upload_document_handoff",
+            env=env,
+            bot_client=bot_client,
+            uploaded=document_upload,
+            post=document_post,
+        )
+    finally:
+        await waiter.stop()
 
 
 async def run_bot_send_owner_read_scenario(
@@ -681,6 +794,25 @@ async def wait_for_post(
     return None
 
 
+async def wait_for_attachment_post(
+    client: RingCentralClient,
+    chat_id: str,
+    file_name: str,
+    uploaded: Any,
+    record_count: int,
+) -> Optional[Dict[str, Any]]:
+    uploaded_post = normalize_uploaded_post(uploaded)
+    if uploaded_post and uploaded_post.get("attachments"):
+        return uploaded_post
+    for _ in range(10):
+        posts = await read_recent_posts(client, chat_id, record_count)
+        found = next((post for post in posts if has_attachment(post, file_name)), None)
+        if found:
+            return found
+        await asyncio.sleep(1.5)
+    return None
+
+
 async def find_recent_post(
     client: RingCentralClient,
     chat_id: str,
@@ -710,6 +842,74 @@ async def read_recent_posts(
     if posts is not None:
         return posts
     raise LiveSmokeFailure(status=client.last_status)
+
+
+def has_attachment(post: Dict[str, Any], expected_file_name: str) -> bool:
+    attachments = post.get("attachments")
+    if not isinstance(attachments, list):
+        return False
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        names = [
+            str(attachment.get("fileName") or "").strip(),
+            str(attachment.get("name") or "").strip(),
+        ]
+        if expected_file_name in names:
+            return True
+        if not any(names) and (attachment.get("contentUri") or attachment.get("uri") or attachment.get("id")):
+            return True
+    return False
+
+
+def normalize_uploaded_post(uploaded: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(uploaded, dict) and uploaded.get("id") and uploaded.get("groupId"):
+        return uploaded
+    return None
+
+
+def extract_upload_attachments(uploaded: Any) -> Optional[List[Dict[str, Any]]]:
+    if isinstance(uploaded, dict):
+        attachments = uploaded.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            return [item for item in attachments if isinstance(item, dict)]
+        if uploaded.get("contentUri") or uploaded.get("uri"):
+            return [uploaded]
+    if isinstance(uploaded, list):
+        attachments = [item for item in uploaded if isinstance(item, dict)]
+        return attachments or None
+    return None
+
+
+async def assert_attachment_download_handoff(
+    *,
+    stage: str,
+    env: LiveEnv,
+    bot_client: RingCentralClient,
+    uploaded: Any,
+    post: Dict[str, Any],
+) -> None:
+    from gateway.config import PlatformConfig
+    from ringcentral.adapter import RingCentralAdapter
+
+    attachments = extract_upload_attachments(uploaded)
+    if not attachments:
+        raw = post.get("attachments")
+        attachments = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    assert_live(attachments, stage)
+    adapter = RingCentralAdapter(
+        PlatformConfig(
+            enabled=True,
+            token=env.bot_token,
+            extra={"attachment_max_bytes": 5 * 1024 * 1024},
+        )
+    )
+    downloaded = await live_step(
+        stage,
+        lambda: adapter._download_attachment(attachments[0], bot_client),
+    )
+    assert_live(downloaded, stage, bot_client)
+    log_safe(stage, media_payload=True)
 
 
 @dataclass
@@ -766,6 +966,63 @@ async def start_websocket_wait(
         filter_own_creator=filter_own_creator,
         on_state=on_state,
         label=label,
+    )
+    await monitor.start()
+
+    async def stop() -> None:
+        await monitor.stop()
+
+    return WebSocketWaiter(
+        connected=connected,
+        subscribed=subscribed,
+        received=received,
+        stop=stop,
+    )
+
+
+async def start_websocket_attachment_wait(
+    *,
+    client: RingCentralClient,
+    person_id: str,
+    chat_id: str,
+    expected_file_name: str,
+) -> WebSocketWaiter:
+    from ringcentral.rc_ws import RingCentralWebSocket
+
+    loop = asyncio.get_running_loop()
+    connected: "asyncio.Future[None]" = loop.create_future()
+    subscribed: "asyncio.Future[None]" = loop.create_future()
+    received: "asyncio.Future[Dict[str, Any]]" = loop.create_future()
+
+    def reject_pending(exc: Exception) -> None:
+        for future in (connected, subscribed, received):
+            if not future.done():
+                future.set_exception(exc)
+
+    async def on_state(event: str, details: Dict[str, Any]) -> None:
+        log_safe("file_upload_ws_state", **sanitize_diagnostic(event, details))
+        if event == "ws_connected" and not connected.done():
+            connected.set_result(None)
+        elif event == "ws_subscription_confirmed" and not subscribed.done():
+            subscribed.set_result(None)
+        elif event == "ws_subscription_rejected":
+            reject_pending(LiveSmokeFailure(status=read_status(details)))
+
+    async def on_event(body: Dict[str, Any]) -> None:
+        if (
+            str(body.get("groupId") or "") == chat_id
+            and has_attachment(body, expected_file_name)
+            and not received.done()
+        ):
+            received.set_result(body)
+
+    monitor = RingCentralWebSocket(
+        client,
+        on_event,
+        own_person_id=person_id,
+        filter_own_creator=True,
+        on_state=on_state,
+        label="live-bot-file-upload",
     )
     await monitor.start()
 
@@ -885,6 +1142,20 @@ def build_unique_text(label: str) -> str:
             f"commit: {commit_sha}" if commit_sha else "",
         )
         if part
+    )
+
+
+def build_unique_file_name(label: str, extension: str) -> str:
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
+    return f"hermes-ringcentral-e2e-{label}-{run_id}-{attempt}-{int(time.time() * 1000)}.{extension}"
+
+
+def tiny_png_bytes() -> bytes:
+    import base64
+
+    return base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lS0N2wAAAABJRU5ErkJggg=="
     )
 
 

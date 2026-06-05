@@ -88,9 +88,16 @@ _THREAD_REQUIRE_MENTION_ENV = "RC_THREAD_REQUIRE_MENTION"
 _NO_THREAD_CHANNELS_ENV = "RC_NO_THREAD_CHANNELS"
 _PROCESSING_EMOJI_ENABLED_ENV = "RC_PROCESSING_EMOJI_ENABLED"
 _PROCESSING_EMOJI_EDIT_DELAY_ENV = "RC_PROCESSING_EMOJI_EDIT_DELAY_SECONDS"
+_ATTACHMENT_DOWNLOAD_ENABLED_ENV = "RC_ATTACHMENT_DOWNLOAD_ENABLED"
+_ATTACHMENT_MAX_COUNT_ENV = "RC_ATTACHMENT_MAX_COUNT"
+_ATTACHMENT_MAX_BYTES_ENV = "RC_ATTACHMENT_MAX_BYTES"
 
 _DEFAULT_HISTORY_MESSAGE_LIMIT = 250
 _MAX_HISTORY_MESSAGE_LIMIT = 1000
+_DEFAULT_ATTACHMENT_MAX_COUNT = 5
+_MAX_ATTACHMENT_MAX_COUNT = 20
+_DEFAULT_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
+_MAX_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024
 _HISTORY_CONTEXT_CHAR_LIMIT = 60000
 _DEFAULT_REPLY_TO_MODE = "first"
 _REPLY_TO_MODES = {"off", "first", "all"}
@@ -479,6 +486,16 @@ def _content_type_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 
+def _normalize_content_type(value: Any) -> str:
+    raw = str(value or "").split(";", 1)[0].strip().lower()
+    return raw or "application/octet-stream"
+
+
+def _safe_attachment_filename(value: Any) -> str:
+    raw = str(value or "").replace("\x00", " ").replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", raw).strip() or "attachment"
+
+
 def _strip_rc_mentions(
     text: str,
     own_person_id: Optional[str],
@@ -639,6 +656,75 @@ def _processing_emoji_edit_delay_seconds(extra: Dict[str, Any]) -> float:
     if value < 0 or value != value:
         return _DEFAULT_PROCESSING_EMOJI_EDIT_DELAY_SECONDS
     return value
+
+
+def _bool_from_extra_or_env(
+    extra: Dict[str, Any],
+    key: str,
+    env_name: str,
+    default: bool,
+) -> bool:
+    raw = extra.get(key)
+    if raw not in (None, ""):
+        if isinstance(raw, bool):
+            return raw
+        value = str(raw).strip().lower()
+        if value in {"true", "1", "yes", "on"}:
+            return True
+        if value in {"false", "0", "no", "off"}:
+            return False
+    return _env_bool(env_name, default)
+
+
+def _bounded_int_from_extra_or_env(
+    extra: Dict[str, Any],
+    key: str,
+    env_name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = extra.get(key)
+    if raw in (None, ""):
+        raw = os.getenv(env_name, "")
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _attachment_download_enabled(extra: Dict[str, Any]) -> bool:
+    return _bool_from_extra_or_env(
+        extra,
+        "attachment_download_enabled",
+        _ATTACHMENT_DOWNLOAD_ENABLED_ENV,
+        True,
+    )
+
+
+def _attachment_max_count(extra: Dict[str, Any]) -> int:
+    return _bounded_int_from_extra_or_env(
+        extra,
+        "attachment_max_count",
+        _ATTACHMENT_MAX_COUNT_ENV,
+        _DEFAULT_ATTACHMENT_MAX_COUNT,
+        0,
+        _MAX_ATTACHMENT_MAX_COUNT,
+    )
+
+
+def _attachment_max_bytes(extra: Dict[str, Any]) -> int:
+    return _bounded_int_from_extra_or_env(
+        extra,
+        "attachment_max_bytes",
+        _ATTACHMENT_MAX_BYTES_ENV,
+        _DEFAULT_ATTACHMENT_MAX_BYTES,
+        1,
+        _MAX_ATTACHMENT_MAX_BYTES,
+    )
 
 
 def _channel_set_matches(channels: set[str], chat_id: str) -> bool:
@@ -859,6 +945,9 @@ class RingCentralAdapter(BasePlatformAdapter):
         self._reply_to_mode = _reply_to_mode_from(extra)
         self._processing_emoji_enabled = _processing_emoji_enabled()
         self._processing_emoji_edit_delay = _processing_emoji_edit_delay_seconds(extra)
+        self._attachment_download_enabled = _attachment_download_enabled(extra)
+        self._attachment_max_count = _attachment_max_count(extra)
+        self._attachment_max_bytes = _attachment_max_bytes(extra)
 
         self._client: Optional[RingCentralClient] = None
         self._owner_client: Optional[RingCentralClient] = None
@@ -2617,6 +2706,8 @@ class RingCentralAdapter(BasePlatformAdapter):
         creator_id = str(body.get("creatorId") or "")
         raw_text = body.get("text") or ""
         attachments = body.get("attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
         thread_id = str(body.get("threadId") or "").strip()
         parent_post_id = str(body.get("parentPostId") or "").strip()
 
@@ -2714,8 +2805,13 @@ class RingCentralAdapter(BasePlatformAdapter):
         media_urls: List[str] = []
         media_types: List[str] = []
         event_client = self._client_for_identity(identity) or self._client
-        if attachments and event_client is not None:
-            for att in attachments:
+        if (
+            self._attachment_download_enabled
+            and self._attachment_max_count > 0
+            and attachments
+            and event_client is not None
+        ):
+            for att in attachments[: self._attachment_max_count]:
                 downloaded = await self._download_attachment(att, event_client)
                 if downloaded:
                     local_path, mime = downloaded
@@ -2777,12 +2873,19 @@ class RingCentralAdapter(BasePlatformAdapter):
         failure. Bearer auth is required for RC's content URLs so we can't
         just hand the URL to downstream tools directly.
         """
-        uri = attachment.get("uri") or attachment.get("contentUri") or ""
+        uri = str(attachment.get("uri") or attachment.get("contentUri") or "").strip()
         if not uri:
             return None
+        if not re.match(r"^https?://", uri, re.IGNORECASE):
+            logger.warning("RingCentral: attachment download skipped: invalid_uri=true")
+            return None
 
-        filename = attachment.get("fileName") or attachment.get("name") or "attachment"
-        mime = attachment.get("contentType") or _content_type_for_filename(filename)
+        filename = _safe_attachment_filename(
+            attachment.get("fileName") or attachment.get("name") or "attachment",
+        )
+        mime = _normalize_content_type(
+            attachment.get("contentType") or _content_type_for_filename(filename),
+        )
 
         import aiohttp
 
@@ -2794,11 +2897,28 @@ class RingCentralAdapter(BasePlatformAdapter):
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status >= 400:
-                    logger.warning("RingCentral: attachment download HTTP %s for %s", resp.status, filename)
+                    logger.warning(
+                        "RingCentral: attachment download failed: http_status=%s",
+                        resp.status,
+                    )
                     return None
-                data = await resp.read()
+                mime = _normalize_content_type(
+                    attachment.get("contentType")
+                    or resp.headers.get("Content-Type")
+                    or _content_type_for_filename(filename),
+                )
+                data = await self._read_limited_attachment(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.warning("RingCentral: attachment download failed: %s", exc)
+            logger.warning(
+                "RingCentral: attachment download failed: network_error=%s",
+                exc.__class__.__name__,
+            )
+            return None
+        except ValueError as exc:
+            logger.warning(
+                "RingCentral: attachment download skipped: reason=%s",
+                str(exc),
+            )
             return None
 
         try:
@@ -2811,9 +2931,33 @@ class RingCentralAdapter(BasePlatformAdapter):
             else:
                 local_path = cache_document_from_bytes(data, filename)
         except ValueError as exc:
-            logger.warning("RingCentral: skipping attachment %s: %s", filename, exc)
+            logger.warning(
+                "RingCentral: attachment cache skipped: error=%s",
+                exc.__class__.__name__,
+            )
             return None
         return local_path, mime
+
+    async def _read_limited_attachment(self, resp: Any) -> bytes:
+        raw_length = str(resp.headers.get("Content-Length") or "").strip()
+        if raw_length:
+            try:
+                declared_size = int(raw_length)
+            except ValueError:
+                declared_size = 0
+            if declared_size > self._attachment_max_bytes:
+                raise ValueError("too_large")
+
+        chunks: List[bytes] = []
+        total = 0
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > self._attachment_max_bytes:
+                raise ValueError("too_large")
+            chunks.append(bytes(chunk))
+        return b"".join(chunks)
 
     # ── Auto-resume guard ─────────────────────────────────────────────────
 

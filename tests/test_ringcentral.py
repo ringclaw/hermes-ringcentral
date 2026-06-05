@@ -105,6 +105,38 @@ def _make_message_event(
     )
 
 
+class _FakeAttachmentContent:
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+
+    async def iter_chunked(self, _size: int):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FakeAttachmentResponse:
+    def __init__(self, *, status: int = 200, chunks: list[bytes] | None = None, headers: dict[str, str] | None = None):
+        self.status = status
+        self.headers = headers or {}
+        self.content = _FakeAttachmentContent(chunks or [])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeAttachmentSession:
+    def __init__(self, response: _FakeAttachmentResponse):
+        self.response = response
+        self.get_calls: list[tuple[Any, dict[str, Any]]] = []
+
+    def get(self, uri: str, **kwargs):
+        self.get_calls.append((uri, kwargs))
+        return self.response
+
+
 # ---------------------------------------------------------------------------
 # OAuth client
 # ---------------------------------------------------------------------------
@@ -450,6 +482,75 @@ class TestRingCentralClientOAuth:
                 {"expect_json": False},
             ),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Inbound attachments
+# ---------------------------------------------------------------------------
+
+
+class TestInboundAttachments:
+    def test_download_attachment_streams_to_image_cache(self):
+        adapter = _make_adapter(extra={"attachment_max_bytes": 10})
+        response = _FakeAttachmentResponse(
+            chunks=[b"im", b"age"],
+            headers={"Content-Type": "image/png", "Content-Length": "5"},
+        )
+        session = _FakeAttachmentSession(response)
+        client = MagicMock()
+        client._ensure_session = AsyncMock(return_value=session)
+        client.bearer_headers = AsyncMock(return_value={"Authorization": "Bearer token"})
+
+        with patch.object(_rc_mod, "cache_image_from_bytes", return_value="/cache/image.png") as cache:
+            result = asyncio.run(adapter._download_attachment({
+                "contentUri": "https://content.example.test/image.png",
+                "name": "image.png",
+            }, client))
+
+        assert result == ("/cache/image.png", "image/png")
+        cache.assert_called_once_with(b"image", ".png")
+        assert session.get_calls[0][0] == "https://content.example.test/image.png"
+        assert session.get_calls[0][1]["headers"] == {"Authorization": "Bearer token"}
+
+    def test_download_attachment_skips_declared_oversize_body(self):
+        adapter = _make_adapter(extra={"attachment_max_bytes": 2})
+        response = _FakeAttachmentResponse(
+            chunks=[b"image"],
+            headers={"Content-Type": "image/png", "Content-Length": "5"},
+        )
+        session = _FakeAttachmentSession(response)
+        client = MagicMock()
+        client._ensure_session = AsyncMock(return_value=session)
+        client.bearer_headers = AsyncMock(return_value={"Authorization": "Bearer token"})
+
+        with patch.object(_rc_mod, "cache_image_from_bytes") as cache:
+            result = asyncio.run(adapter._download_attachment({
+                "contentUri": "https://content.example.test/image.png",
+                "name": "image.png",
+            }, client))
+
+        assert result is None
+        cache.assert_not_called()
+
+    def test_download_attachment_skips_stream_oversize_body(self):
+        adapter = _make_adapter(extra={"attachment_max_bytes": 3})
+        response = _FakeAttachmentResponse(
+            chunks=[b"ab", b"cd"],
+            headers={"Content-Type": "text/plain"},
+        )
+        session = _FakeAttachmentSession(response)
+        client = MagicMock()
+        client._ensure_session = AsyncMock(return_value=session)
+        client.bearer_headers = AsyncMock(return_value={"Authorization": "Bearer token"})
+
+        with patch.object(_rc_mod, "cache_document_from_bytes") as cache:
+            result = asyncio.run(adapter._download_attachment({
+                "contentUri": "https://content.example.test/doc.txt",
+                "name": "doc.txt",
+            }, client))
+
+        assert result is None
+        cache.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1543,6 +1644,56 @@ class TestOwnerInboundHandling:
 
         adapter.handle_message.assert_awaited_once()
 
+    def test_mentioned_group_attachment_is_downloaded_into_message_event(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = self._allowed_group_adapter()
+        adapter._download_attachment = AsyncMock(return_value=("/cache/image.png", "image/png"))
+        body = self._mentioned_group_body()
+        body["attachments"] = [{
+            "id": "a-1",
+            "contentUri": "https://content.example.test/a.png",
+            "name": "image.png",
+            "contentType": "image/png",
+        }]
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter._download_attachment.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == _rc_mod.MessageType.PHOTO
+        assert event.media_urls == ["/cache/image.png"]
+        assert event.media_types == ["image/png"]
+
+    def test_attachment_download_disabled_still_dispatches_text(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        adapter = _make_adapter(extra={"attachment_download_enabled": False})
+        client = MagicMock()
+        client.list_chats = AsyncMock(return_value=[
+            {"id": "g-1", "type": "Team", "name": "Project"},
+        ])
+        client.get_person = AsyncMock(return_value={
+            "firstName": "Alice",
+            "email": "alice@example.com",
+        })
+        adapter._client = client
+        adapter._own_person_id = "bot-1"
+        adapter._download_attachment = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        body = self._mentioned_group_body()
+        body["attachments"] = [{
+            "id": "a-1",
+            "contentUri": "https://content.example.test/a.png",
+        }]
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter._download_attachment.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == _rc_mod.MessageType.TEXT
+        assert event.media_urls is None
+
     def test_non_allowed_channel_blocks_mentioned_group_message(self, monkeypatch):
         monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
         monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-2")
@@ -1552,6 +1703,22 @@ class TestOwnerInboundHandling:
             adapter._handle_ws_event(self._mentioned_group_body(), identity="bot")
         )
 
+        adapter.handle_message.assert_not_awaited()
+
+    def test_channel_gate_rejection_does_not_download_attachment(self, monkeypatch):
+        monkeypatch.setenv("RC_ALLOWED_USER_EMAILS", "alice@example.com")
+        monkeypatch.setenv("RC_ALLOWED_CHANNELS", "g-2")
+        adapter = self._allowed_group_adapter()
+        adapter._download_attachment = AsyncMock()
+        body = self._mentioned_group_body()
+        body["attachments"] = [{
+            "id": "a-1",
+            "contentUri": "https://content.example.test/a.png",
+        }]
+
+        asyncio.run(adapter._handle_ws_event(body, identity="bot"))
+
+        adapter._download_attachment.assert_not_awaited()
         adapter.handle_message.assert_not_awaited()
 
     def test_ignored_channel_blocks_mentioned_group_message(self, monkeypatch):
