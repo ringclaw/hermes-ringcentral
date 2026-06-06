@@ -1,5 +1,11 @@
 # Hermes RingCentral 插件
 
+[![PyPI version](https://img.shields.io/pypi/v/hermes-ringcentral)](https://pypi.org/project/hermes-ringcentral/)
+[![Python versions](https://img.shields.io/pypi/pyversions/hermes-ringcentral)](https://pypi.org/project/hermes-ringcentral/)
+[![Release](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/release.yml/badge.svg)](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/release.yml)
+[![Test](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/test.yml/badge.svg)](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/test.yml)
+[![RingCentral Live Smoke](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/ringcentral-live-smoke.yml/badge.svg)](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/ringcentral-live-smoke.yml)
+
 这个插件把 RingCentral Team Messaging 接入 Hermes Agent。你可以让 Hermes
 通过 RingCentral bot 回复私聊和群聊、在 thread 里回复、按 owner 权限读取群聊或私聊历史并总结，也可以把 cron 通知投递到 RingCentral。
 
@@ -12,6 +18,14 @@
 ```sh
 hermes plugins install ringclaw/hermes-ringcentral --enable
 ```
+
+也可以直接安装已经发布到 PyPI 的 Python 包：
+
+```sh
+pip install hermes-ringcentral
+```
+
+该包暴露 `hermes_agent.plugins` entry point，安装后 Hermes 可以自动发现插件。
 
 安装器会提示填写 `RC_BOT_TOKEN`，并保存到 `~/.hermes/.env`。如果插件已经安装但没有启用，执行：
 
@@ -150,6 +164,12 @@ Hermes 会根据需要调用 `ringcentral_get_recent_messages` 工具，使用 o
 - **附件处理**：图片、音频、文档会下载到 Hermes 缓存，供视觉或文件工具继续处理。
 - **Cron 投递**：通过 `RC_HOME_CHANNEL` 把定时任务和通知送到 RingCentral。
 - **Webhook 空 text fallback**：当新 Team Messaging posts API 对 integration/webhook 消息返回空 text 时，会尝试旧 Glip 接口补齐文本。
+
+## 发布
+
+稳定版本通过推送 `v*` tag 发布。Release workflow 会校验 tag 与
+`pyproject.toml` 版本一致，运行测试，构建 sdist 和 wheel，通过 PyPI
+Trusted Publishing 发布 `hermes-ringcentral`，并创建 GitHub Release。
 
 ## 常见问题
 

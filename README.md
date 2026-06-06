@@ -1,5 +1,11 @@
 # Hermes RingCentral Plugin
 
+[![PyPI version](https://img.shields.io/pypi/v/hermes-ringcentral)](https://pypi.org/project/hermes-ringcentral/)
+[![Python versions](https://img.shields.io/pypi/pyversions/hermes-ringcentral)](https://pypi.org/project/hermes-ringcentral/)
+[![Release](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/release.yml/badge.svg)](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/release.yml)
+[![Test](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/test.yml/badge.svg)](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/test.yml)
+[![RingCentral Live Smoke](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/ringcentral-live-smoke.yml/badge.svg)](https://github.com/ringclaw/hermes-ringcentral/actions/workflows/ringcentral-live-smoke.yml)
+
 RingCentral Team Messaging support for Hermes Agent. This plugin lets a Hermes
 agent talk through a RingCentral bot, reply in threads, read owner-visible chat
 history when explicitly requested by the owner, and deliver scheduled
@@ -14,6 +20,15 @@ Install with the Hermes plugin manager:
 ```sh
 hermes plugins install ringclaw/hermes-ringcentral --enable
 ```
+
+You can also install the published Python package directly:
+
+```sh
+pip install hermes-ringcentral
+```
+
+The package exposes a `hermes_agent.plugins` entry point so Hermes can discover
+the plugin after installation.
 
 The installer prompts for `RC_BOT_TOKEN` and saves it to `~/.hermes/.env`. If
 the plugin is already installed but disabled, enable it with:
@@ -166,6 +181,13 @@ Create a daily 9am reminder and deliver it to RingCentral.
   sender support.
 - **Webhook text fallback** for integration posts where the modern Team
   Messaging posts API returns empty text.
+
+## Release
+
+Stable releases are published by pushing a `v*` tag. The release workflow
+validates that the tag matches `pyproject.toml`, runs tests, builds the sdist
+and wheel, publishes `hermes-ringcentral` to PyPI with Trusted Publishing, and
+creates a GitHub Release.
 
 ## Troubleshooting
 
