@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp websockets pytest pytest-asyncio
+          pip install git+https://github.com/NousResearch/hermes-agent.git
+          pip install -e .
+
+      - name: Validate tag version
+        run: |
+          python <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tomllib
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          if not tag.startswith("v"):
+              print(f'Release tag must start with "v": {tag}', file=sys.stderr)
+              raise SystemExit(1)
+          version = tag[1:]
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+          package_version = project["version"]
+          if package_version != version:
+              print(
+                  f"Tag {tag} does not match pyproject.toml version {package_version}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          print(f"Validated release {tag}")
+          PY
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
