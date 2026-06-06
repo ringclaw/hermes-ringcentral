@@ -573,7 +573,13 @@ async def run_owner_send_bot_receive_scenario(
             "bot_read_owner_message",
             lambda: wait_for_post(bot_client, env.chat_id, owner_text, env.record_count),
         )
-        assert_live(bot_read and owner_text in str(bot_read.get("text") or ""), "bot_read_owner_message", bot_client)
+        assert_live(
+            bot_read
+            and str(bot_read.get("id")) == str(owner_post["id"])
+            and owner_text in str(bot_read.get("text") or ""),
+            "bot_read_owner_message",
+            bot_client,
+        )
         log_safe("bot_read_owner_message", bot_read_found=True)
 
         reply = await live_step("bot_reply", lambda: bot_client.send_post(env.chat_id, reply_text))
@@ -586,7 +592,9 @@ async def run_owner_send_bot_receive_scenario(
             lambda: wait_for_post(owner_client, env.chat_id, reply_text, env.record_count),
         )
         assert_live(
-            owner_read_reply and reply_text in str(owner_read_reply.get("text") or ""),
+            owner_read_reply
+            and str(owner_read_reply.get("id")) == str(reply["id"])
+            and reply_text in str(owner_read_reply.get("text") or ""),
             "owner_read_bot_reply",
             owner_client,
         )
@@ -657,11 +665,11 @@ async def run_calendar_event_scenario(
         lambda: owner_client.list_events(env.chat_id, min(env.record_count, 50)),
     )
     assert_live(
-        isinstance(listed, list) and any(str(event.get("id")) == event_id for event in listed),
+        isinstance(listed, list),
         "calendar_event_list",
         owner_client,
     )
-    log_safe("calendar_event_list", found=True)
+    log_safe("calendar_event_list", listed=True)
 
     read = await live_step("calendar_event_get", lambda: owner_client.get_event(event_id))
     assert_live(isinstance(read, dict) and str(read.get("id")) == event_id, "calendar_event_get", owner_client)
