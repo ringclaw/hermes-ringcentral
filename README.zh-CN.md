@@ -23,9 +23,13 @@ hermes plugins install ringclaw/hermes-ringcentral --enable
 
 ```sh
 pip install hermes-ringcentral
+hermes plugins enable ringcentral-platform
+hermes gateway restart
 ```
 
 该包暴露 `hermes_agent.plugins` entry point，安装后 Hermes 可以自动发现插件。
+直接 pip 安装不会触发 Hermes 插件安装器的凭证提示，所以重启 gateway 前需要手动把
+`RC_BOT_TOKEN` 和其他可选 `RC_*` 配置写入 `~/.hermes/.env`。
 
 安装器会提示填写 `RC_BOT_TOKEN`，并保存到 `~/.hermes/.env`。如果插件已经安装但没有启用，执行：
 

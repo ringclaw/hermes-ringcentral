@@ -25,10 +25,14 @@ You can also install the published Python package directly:
 
 ```sh
 pip install hermes-ringcentral
+hermes plugins enable ringcentral-platform
+hermes gateway restart
 ```
 
 The package exposes a `hermes_agent.plugins` entry point so Hermes can discover
-the plugin after installation.
+the plugin after installation. Direct pip installs do not run the Hermes plugin
+installer prompt, so configure `RC_BOT_TOKEN` and any optional `RC_*` values in
+`~/.hermes/.env` before restarting the gateway.
 
 The installer prompts for `RC_BOT_TOKEN` and saves it to `~/.hermes/.env`. If
 the plugin is already installed but disabled, enable it with:
