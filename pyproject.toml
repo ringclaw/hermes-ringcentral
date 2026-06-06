@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-ringcentral"
-version = "2026.6.6"
+version = "2026.6.7"
 description = "RingCentral Team Messaging gateway adapter for Hermes Agent"
 readme = "README.md"
 license = {text = "MIT"}
